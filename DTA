@@ -1,0 +1,557 @@
+# app.R
+library(shiny)
+library(bs4Dash)
+library(tidyverse)
+library(DT)
+library(pROC)
+library(haven)
+
+ui <- bs4DashPage(
+  title = "DTA Analysis Dashboard",
+  
+  header = bs4DashNavbar(title = "Mega DTA Analysis"),
+  
+  sidebar = bs4DashSidebar(
+    skin = "light",
+    status = "primary",
+    brandColor = "primary",
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Data & Threshold", tabName = "data_thresh", icon = icon("database")),
+      bs4SidebarMenuItem("Overview", tabName = "overview", icon = icon("info-circle")),
+      bs4SidebarMenuItem("Standard Metrics", tabName = "std_metrics", icon = icon("table")),
+      bs4SidebarMenuItem("Advanced Metrics", tabName = "adv_metrics", icon = icon("chart-line")),
+      bs4SidebarMenuItem("Plots", tabName = "plots", icon = icon("image")),
+      bs4SidebarMenuItem("Extra Text Output", tabName = "extra_text", icon = icon("comment"))
+    )
+  ),
+  
+  body = bs4DashBody(
+    bs4TabItems(
+      
+      # ============= Data & Threshold Tab =============
+      bs4TabItem(
+        tabName = "data_thresh",
+        fluidRow(
+          bs4Card(
+            title = "Upload & Analysis Controls",
+            width = 12,
+            fileInput("file_dta", "Upload CSV or Stata file", 
+                      accept = c(".csv", ".dta")),
+            uiOutput("threshold_slider_ui"),
+            actionButton("analyze_btn", "Run DTA Analysis")
+          )
+        )
+      ),
+      
+      # ============= Overview Tab =============
+      bs4TabItem(
+        tabName = "overview",
+        fluidRow(
+          bs4Card(
+            title = "Overview of Data & Selections",
+            width = 12,
+            textOutput("auto_selection_info"),
+            textOutput("overview_text")
+          )
+        )
+      ),
+      
+      # ============= Standard Metrics Tab =============
+      bs4TabItem(
+        tabName = "std_metrics",
+        fluidRow(
+          bs4Card(
+            title = "Standard DTA Metrics",
+            width = 6,
+            DTOutput("summary_table")
+          ),
+          bs4Card(
+            title = "Confusion Matrix",
+            width = 6,
+            DTOutput("conf_matrix_table")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = "ROC Curve",
+            width = 12,
+            plotOutput("roc_plot", height = "300px")
+          )
+        )
+      ),
+      
+      # ============= Advanced Metrics Tab =============
+      bs4TabItem(
+        tabName = "adv_metrics",
+        fluidRow(
+          bs4Card(
+            title = "Advanced Summaries",
+            width = 6,
+            DTOutput("advanced_metrics_table")
+          ),
+          bs4Card(
+            title = "Confidence Intervals",
+            width = 6,
+            DTOutput("ci_table")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = "Precision-Recall Curve",
+            width = 12,
+            plotOutput("pr_curve_plot", height = "300px")
+          )
+        )
+      ),
+      
+      # ============= Plots Tab =============
+      bs4TabItem(
+        tabName = "plots",
+        fluidRow(
+          bs4Card(
+            title = "Boxplot (Test by Reference)",
+            width = 6,
+            plotOutput("boxplot_test", height = "300px")
+          ),
+          bs4Card(
+            title = "Histogram (Test Distribution)",
+            width = 6,
+            plotOutput("hist_test", height = "300px")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = "Density Plot by Reference Category",
+            width = 6,
+            plotOutput("density_plot", height = "300px")
+          ),
+          bs4Card(
+            title = "Calibration-Like Plot",
+            width = 6,
+            plotOutput("calibration_plot", height = "300px")
+          )
+        )
+      ),
+      
+      # ============= Extra Text Output Tab =============
+      bs4TabItem(
+        tabName = "extra_text",
+        fluidRow(
+          bs4Card(
+            title = "Additional Interpretation / Notes",
+            width = 12,
+            p("Here you can add extensive text discussions or interpretations of results, 
+               instructions for next steps, disclaimers about the data, or any other relevant 
+               documentation your users might need."),
+            strong("Recommended Next Steps:"),
+            tags$ul(
+              tags$li("Review your data for outliers or missing values."),
+              tags$li("Consider adjusting the threshold to optimize for your desired metric (e.g., Youden’s J, F1)."),
+              tags$li("Look at confidence intervals for sensitivity/specificity to gauge the uncertainty in these estimates."),
+              tags$li("Examine the Precision-Recall curve if your dataset is imbalanced (low prevalence).")
+            ),
+            p("Feel free to expand these text sections with references, images, or additional guidance. 
+               This tab can become as verbose as you like.")
+          )
+        )
+      )
+      
+    )
+  ),
+  
+  controlbar = bs4DashControlbar(),
+  footer = bs4DashFooter()
+)
+
+# ---------------------------------------------------------------------------
+# SERVER LOGIC
+# ---------------------------------------------------------------------------
+server <- function(input, output, session) {
+  
+  library(DescTools)  # For BinomCI if you want an alternative to prop.test CI; remove or comment if not installed
+  
+  # Reactive for uploading & reading data
+  dta_data <- reactive({
+    req(input$file_dta)
+    ext <- tools::file_ext(input$file_dta$name)
+    if (ext == "csv") {
+      read.csv(input$file_dta$datapath)
+    } else if (ext == "dta") {
+      haven::read_dta(input$file_dta$datapath)
+    } else {
+      stop("Unsupported file type. Please upload a CSV or DTA file.")
+    }
+  })
+  
+  # ReactiveValues to store key columns & results
+  auto_vars <- reactiveValues(ref_var_name = NULL, test_var_name = NULL)
+  analysis <- reactiveValues(
+    # Will store stuff after we run the analysis
+    data = NULL,
+    ref_factor = NULL,
+    test_var = NULL,
+    cutoff = NA,
+    cm = NULL,
+    metrics = NULL,
+    advanced = NULL,
+    ci = NULL,
+    roc_obj = NULL,
+    pr_df = NULL
+  )
+  
+  # Auto-detect columns once the file is uploaded
+  observeEvent(dta_data(), {
+    data <- dta_data()
+    numeric_cols <- names(data)[sapply(data, is.numeric)]
+    ref_candidates <- numeric_cols[sapply(data[numeric_cols], function(x) all(na.omit(x) %in% c(0,1)))]
+    
+    # pick "status" if it’s 0/1
+    if ("status" %in% ref_candidates) {
+      ref_var_name <- "status"
+    } else if (length(ref_candidates) >= 1) {
+      ref_var_name <- ref_candidates[1]
+    } else {
+      # fallback
+      ref_var_name <- names(data)[1]
+      showNotification("No clear 0/1 reference column found. Using the first column.", type = "warning")
+    }
+    
+    # pick test_value if present, else first numeric not ref
+    test_candidates <- setdiff(numeric_cols, ref_var_name)
+    if ("test_value" %in% names(data)) {
+      test_var_name <- "test_value"
+    } else if (length(test_candidates) >= 1) {
+      test_var_name <- test_candidates[1]
+    } else {
+      # fallback
+      if (length(names(data)) >= 2) {
+        test_var_name <- names(data)[2]
+      } else {
+        test_var_name <- names(data)[1]
+        showNotification("No numeric test column found. Using first column by default.", type = "warning")
+      }
+    }
+    
+    auto_vars$ref_var_name <- ref_var_name
+    auto_vars$test_var_name <- test_var_name
+  })
+  
+  # Create a threshold slider if numeric test var
+  output$threshold_slider_ui <- renderUI({
+    req(dta_data())
+    req(auto_vars$test_var_name)
+    data <- dta_data()
+    
+    test_col <- data[[ auto_vars$test_var_name ]]
+    if (!is.numeric(test_col)) {
+      return(tagList(
+        strong("Test variable is not numeric, no threshold slider available.")
+      ))
+    }
+    
+    min_val <- min(test_col, na.rm = TRUE)
+    max_val <- max(test_col, na.rm = TRUE)
+    median_val <- median(test_col, na.rm = TRUE)
+    
+    sliderInput("threshold", "Classification Threshold:", 
+                min = min_val, max = max_val, 
+                value = median_val,
+                step = (max_val - min_val) / 100)
+  })
+  
+  # Display some overview text
+  output$auto_selection_info <- renderText({
+    req(auto_vars$ref_var_name, auto_vars$test_var_name)
+    paste0("Reference Column (assumed 0=Negative, 1=Positive): ", auto_vars$ref_var_name, "\n",
+           "Test Column (numeric): ", auto_vars$test_var_name)
+  })
+  
+  output$overview_text <- renderText({
+    # Could show more info about the dataset
+    req(dta_data())
+    paste0(
+      "Total Rows in Dataset: ", nrow(dta_data()), "\n",
+      "Number of Columns: ", ncol(dta_data())
+    )
+  })
+  
+  # Main Analysis Logic
+  observeEvent(input$analyze_btn, {
+    data <- dta_data()
+    req(data, auto_vars$ref_var_name, auto_vars$test_var_name)
+    
+    ref_var_name <- auto_vars$ref_var_name
+    test_var_name <- auto_vars$test_var_name
+    
+    # Subset and clean
+    ref_var <- data[[ ref_var_name ]]
+    test_var <- data[[ test_var_name ]]
+    
+    # Remove NAs
+    complete_idx <- complete.cases(ref_var, test_var)
+    ref_var <- ref_var[complete_idx]
+    test_var <- test_var[complete_idx]
+    data_clean <- data[complete_idx, ]
+    
+    # Factor reference
+    ref_factor <- factor(ref_var, levels = c(0,1), labels = c("Negative", "Positive"))
+    
+    # Threshold
+    cutoff <- NA
+    if (is.numeric(test_var) && !is.null(input$threshold)) {
+      cutoff <- input$threshold
+    }
+    test_binary <- if (!is.numeric(test_var) || is.null(cutoff)) {
+      rep("Negative", length(test_var))
+    } else {
+      ifelse(test_var >= cutoff, "Positive", "Negative")
+    }
+    
+    # Confusion matrix
+    cm <- table(Predicted = test_binary, Reference = ref_factor)
+    
+    # Extract counts
+    tp <- ifelse("Positive" %in% rownames(cm) & "Positive" %in% colnames(cm), cm["Positive","Positive"], 0)
+    fp <- ifelse("Positive" %in% rownames(cm) & "Negative" %in% colnames(cm), cm["Positive","Negative"], 0)
+    tn <- ifelse("Negative" %in% rownames(cm) & "Negative" %in% colnames(cm), cm["Negative","Negative"], 0)
+    fn <- ifelse("Negative" %in% rownames(cm) & "Positive" %in% colnames(cm), cm["Negative","Positive"], 0)
+    
+    # Standard metrics
+    sensitivity <- ifelse(tp+fn==0, NA, tp/(tp+fn))
+    specificity <- ifelse(tn+fp==0, NA, tn/(tn+fp))
+    ppv         <- ifelse(tp+fp==0, NA, tp/(tp+fp))
+    npv         <- ifelse(tn+fn==0, NA, tn/(tn+fn))
+    
+    # AUC if numeric + both classes exist
+    roc_obj <- NULL
+    auc_val <- NA
+    if (is.numeric(test_var) && length(unique(ref_factor)) == 2) {
+      roc_obj <- tryCatch({
+        pROC::roc(ref_factor, test_var, levels=c("Negative","Positive"), direction="<")
+      }, error=function(e) NULL)
+      if (!is.null(roc_obj)) {
+        auc_val <- pROC::auc(roc_obj)
+      }
+    }
+    
+    # Store standard metrics
+    metrics_df <- data.frame(
+      Metric = c("Reference Column", "Test Column", "Threshold", 
+                 "Sensitivity", "Specificity", "PPV", "NPV", "AUC"),
+      Value = c(
+        ref_var_name,
+        test_var_name,
+        ifelse(is.numeric(test_var), round(cutoff, 3), "Non-numeric test"),
+        round(sensitivity,3),
+        round(specificity,3),
+        round(ppv,3),
+        round(npv,3),
+        ifelse(is.na(auc_val), NA, round(auc_val,3))
+      )
+    )
+    
+    # Advanced metrics
+    balanced_acc <- mean(c(sensitivity, specificity), na.rm=TRUE)
+    f1_score <- if(!is.na(ppv) && !is.na(sensitivity) && (ppv + sensitivity) != 0) {
+      2 * (ppv * sensitivity) / (ppv + sensitivity)
+    } else {
+      NA
+    }
+    prevalence <- (tp+fn)/(tp+fn+tn+fp)
+    
+    adv_df <- data.frame(
+      Metric = c("F1 Score", "Balanced Accuracy", "Prevalence"),
+      Value  = c(round(f1_score,3), round(balanced_acc,3), round(prevalence,3))
+    )
+    
+    # Confidence intervals with prop.test (approx)
+    # sensitivity CI
+    sens_ci <- if(!is.na(sensitivity)) {
+      ci <- prop.test(tp, tp+fn)$conf.int
+      paste0("(", round(ci[1],3), ", ", round(ci[2],3), ")")
+    } else { NA }
+    
+    spec_ci <- if(!is.na(specificity)) {
+      ci <- prop.test(tn, tn+fp)$conf.int
+      paste0("(", round(ci[1],3), ", ", round(ci[2],3), ")")
+    } else { NA }
+    
+    ppv_ci <- if(!is.na(ppv)) {
+      ci <- prop.test(tp, tp+fp)$conf.int
+      paste0("(", round(ci[1],3), ", ", round(ci[2],3), ")")
+    } else { NA }
+    
+    npv_ci <- if(!is.na(npv)) {
+      ci <- prop.test(tn, tn+fn)$conf.int
+      paste0("(", round(ci[1],3), ", ", round(ci[2],3), ")")
+    } else { NA }
+    
+    ci_df <- data.frame(
+      Metric = c("Sensitivity CI", "Specificity CI", "PPV CI", "NPV CI"),
+      "Confidence Interval (Approx)" = c(sens_ci, spec_ci, ppv_ci, npv_ci)
+    )
+    
+    # Precision-Recall data if numeric
+    pr_df <- NULL
+    if (is.numeric(test_var) && length(unique(ref_factor))==2) {
+      test_min <- min(test_var, na.rm=TRUE)
+      test_max <- max(test_var, na.rm=TRUE)
+      thresholds <- seq(test_min, test_max, length.out = 50)
+      
+      pr_list <- lapply(thresholds, function(th) {
+        pred <- ifelse(test_var >= th, "Positive", "Negative")
+        cmat <- table(pred, ref_factor)
+        tpx <- ifelse("Positive" %in% rownames(cmat) & "Positive" %in% colnames(cmat), cmat["Positive","Positive"], 0)
+        fpx <- ifelse("Positive" %in% rownames(cmat) & "Negative" %in% colnames(cmat), cmat["Positive","Negative"], 0)
+        fnx <- ifelse("Negative" %in% rownames(cmat) & "Positive" %in% colnames(cmat), cmat["Negative","Positive"], 0)
+        precision_x <- ifelse((tpx+fpx)==0, NA, tpx/(tpx+fpx))
+        recall_x    <- ifelse((tpx+fnx)==0, NA, tpx/(tpx+fnx))
+        data.frame(threshold = th, Precision=precision_x, Recall=recall_x)
+      })
+      pr_df <- do.call(rbind, pr_list)
+    }
+    
+    # Save all results to the analysis reactiveValues
+    analysis$data         <- data_clean
+    analysis$ref_factor   <- ref_factor
+    analysis$test_var     <- test_var
+    analysis$cutoff       <- cutoff
+    analysis$cm           <- cm
+    analysis$metrics      <- metrics_df
+    analysis$advanced     <- adv_df
+    analysis$ci           <- ci_df
+    analysis$roc_obj      <- roc_obj
+    analysis$pr_df        <- pr_df
+    
+    # Render confusion matrix & summary table in the server
+    # (We'll do it in separate outputs below)
+    
+    # Done with analysis, the rest of the tabs will display these results
+  })
+  
+  # ------------------ Standard Metrics Outputs ------------------
+  output$summary_table <- renderDT({
+    req(analysis$metrics)
+    datatable(analysis$metrics, options=list(dom="t"), rownames=FALSE)
+  })
+  
+  output$conf_matrix_table <- renderDT({
+    req(analysis$cm)
+    cm_df <- as.data.frame.matrix(analysis$cm)
+    datatable(cm_df, options=list(dom="t"), rownames=TRUE)
+  })
+  
+  output$roc_plot <- renderPlot({
+    req(analysis$roc_obj)
+    plot(analysis$roc_obj, main="ROC Curve")
+  })
+  
+  # ------------------ Advanced Metrics & CI ------------------
+  output$advanced_metrics_table <- renderDT({
+    req(analysis$advanced)
+    datatable(analysis$advanced, options=list(dom="t"), rownames=FALSE)
+  })
+  
+  output$ci_table <- renderDT({
+    req(analysis$ci)
+    datatable(analysis$ci, options=list(dom="t"), rownames=FALSE)
+  })
+  
+  output$pr_curve_plot <- renderPlot({
+    req(analysis$pr_df)
+    ggplot(analysis$pr_df, aes(x=Recall, y=Precision)) +
+      geom_line() + geom_point() +
+      theme_minimal() +
+      labs(title="Precision-Recall Curve")
+  })
+  
+  # ------------------ Plots Tab ------------------
+  output$boxplot_test <- renderPlot({
+    req(analysis$data, analysis$ref_factor, analysis$test_var)
+    # Must have numeric test, two reference levels
+    if (is.numeric(analysis$test_var) && length(unique(analysis$ref_factor))==2) {
+      ggplot(analysis$data, aes(x=analysis$ref_factor, y=analysis$test_var)) +
+        geom_boxplot(fill="lightblue") +
+        theme_minimal() +
+        labs(x="Reference", y="Test Value", title="Boxplot of Test by Reference")
+    } else {
+      plot.new()
+      text(0.5, 0.5, "Boxplot not available.\nCheck numeric test & two-level reference.", cex=1.2)
+    }
+  })
+  
+  output$hist_test <- renderPlot({
+    req(analysis$data, analysis$test_var)
+    if (is.numeric(analysis$test_var)) {
+      ggplot(analysis$data, aes(x=analysis$test_var)) +
+        geom_histogram(fill="lightgreen", color="black", 
+                       binwidth = (max(analysis$test_var, na.rm=TRUE) -
+                                     min(analysis$test_var, na.rm=TRUE))/30) +
+        theme_minimal() +
+        labs(x="Test Value", y="Count", title="Histogram of Test Value")
+    } else {
+      plot.new()
+      text(0.5, 0.5, "Histogram not available.\nTest variable not numeric.", cex=1.2)
+    }
+  })
+  
+  # Density Plot: Compare test distribution between Negative & Positive
+  output$density_plot <- renderPlot({
+    req(analysis$data, analysis$ref_factor, analysis$test_var)
+    if (is.numeric(analysis$test_var) && length(unique(analysis$ref_factor))==2) {
+      df <- analysis$data
+      df$ref_factor <- analysis$ref_factor
+      df$test_val   <- analysis$test_var
+      ggplot(df, aes(x=test_val, color=ref_factor)) +
+        geom_density() +
+        theme_minimal() +
+        labs(x="Test Value", color="Reference",
+             title="Density Plot by Reference Category")
+    } else {
+      plot.new()
+      text(0.5, 0.5, "Density plot not available.\nCheck numeric test & two-level reference.", cex=1.2)
+    }
+  })
+  
+  # Calibration-like Plot: 
+  # We'll bin the test variable into deciles & compare predicted mean to actual outcome
+  output$calibration_plot <- renderPlot({
+    req(analysis$data, analysis$test_var, analysis$ref_factor)
+    if (!is.numeric(analysis$test_var) || length(unique(analysis$ref_factor)) != 2) {
+      plot.new()
+      text(0.5, 0.5, "Calibration plot not available.\nCheck numeric test & two-level reference.", cex=1.2)
+      return()
+    }
+    
+    df <- data.frame(
+      test_val = analysis$test_var,
+      ref_fac  = analysis$ref_factor
+    )
+    # Convert ref_fac to 0/1 numeric for "actual"
+    df$actual <- ifelse(df$ref_fac == "Positive", 1, 0)
+    # Bin test values
+    df$bin <- ntile(df$test_val, 10)  # deciles
+    
+    cal_df <- df %>%
+      group_by(bin) %>%
+      summarize(
+        mean_test = mean(test_val, na.rm=TRUE),
+        mean_actual = mean(actual, na.rm=TRUE),
+        n = n()
+      ) %>%
+      ungroup()
+    
+    ggplot(cal_df, aes(x=mean_test, y=mean_actual)) +
+      geom_point(size=2) +
+      geom_line() +
+      theme_minimal() +
+      labs(x="Mean Predicted (Test Value in Each Bin)",
+           y="Mean Actual Outcome (Proportion Positive)",
+           title="Calibration-Like Plot (Binned)") +
+      coord_cartesian(xlim=c(min(df$test_val), max(df$test_val)), ylim=c(0,1))
+  })
+}
+
+shinyApp(ui, server)
+
+
