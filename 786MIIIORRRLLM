@@ -1,0 +1,471 @@
+library(shiny)
+library(bs4Dash)
+library(meta)
+library(metafor)
+library(dplyr)
+library(httr)
+library(jsonlite)
+library(dmetar)
+
+# ---------------------------
+# Helper Functions
+# ---------------------------
+generate_content <- function(prompt, api_key) {
+  url <- paste0("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=", api_key)
+  body <- list(contents = list(list(parts = list(list(text = prompt)))))
+  res <- POST(url,
+              body = toJSON(body, auto_unbox = TRUE),
+              encode = "json",
+              add_headers(`Content-Type` = "application/json"))
+  parsed <- fromJSON(content(res, as = "text", encoding = "UTF-8"), simplifyVector = FALSE)
+  generated <- ""
+  if (!is.null(parsed$candidates) && length(parsed$candidates) > 0) {
+    candidate <- parsed$candidates[[1]]
+    if (!is.null(candidate$content) &&
+        !is.null(candidate$content$parts) &&
+        length(candidate$content$parts) > 0 &&
+        !is.null(candidate$content$parts[[1]]$text)) {
+      generated <- candidate$content$parts[[1]]$text
+    }
+  }
+  list(generated = generated)
+}
+
+clean_markdown <- function(text) {
+  text <- gsub("\\*\\*", "", text)
+  text <- gsub("\\*", "", text)
+  text <- gsub("#", "", text)
+  text
+}
+
+# ---------------------------
+# UI
+# ---------------------------
+ui <- bs4DashPage(
+  title = "RR/OR Meta-Analysis Text and LLM Integration (Give up to ten minutes)",
+  header = bs4DashNavbar(title = "RR/OR Meta-Analysis Text & LLM Integration"),
+  sidebar = bs4DashSidebar(
+    sidebarMenu(
+      menuItem("Inputs", tabName = "inputs", icon = icon("upload")),
+      menuItem("Meta-Analysis Text", tabName = "meta_text", icon = icon("file-alt"))
+    )
+  ),
+  body = bs4DashBody(
+    tabItems(
+      # Inputs Tab
+      tabItem(
+        tabName = "inputs",
+        box(
+          title = "Data Input, Options & Sample CSV Downloads",
+          status = "primary",
+          solidHeader = TRUE,
+          width = 12,
+          p("Upload a CSV file with the following columns (binary outcome data for RR/OR): 
+            evente, totale, eventc, totalc, author, Reg, Reg2, Reg3, Subgroup."),
+          fileInput("fileInput", "Upload CSV File", accept = c("text/csv", ".csv")),
+          br(),
+          # Download buttons for sample CSV files
+          fluidRow(
+            column(4, downloadButton("downloadBasic", "Download Basic Sample CSV")),
+            column(4, downloadButton("downloadMeta", "Download Meta-Regression Sample CSV")),
+            column(4, downloadButton("downloadExtended", "Download Extended Sample CSV"))
+          ),
+          br(),
+          radioButtons("effectMeasure", "Effect Measure:", choices = c("RR", "OR"), selected = "RR"),
+          selectInput("method.tau", "Heterogeneity Method:", 
+                      choices = c("DL", "REML", "PM", "EB", "SJ"), selected = "PM"),
+          selectInput("effectModel", "Effect Model:", 
+                      choices = c("Random" = "RE", "Fixed" = "FE"), selected = "RE")
+        )
+      ),
+      # Meta-Analysis Text Tab
+      tabItem(
+        tabName = "meta_text",
+        fluidRow(
+          box(
+            title = "Expanded Meta-Analysis Text Results (Give up to ten minutes)",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            tabBox(
+              width = 12,
+              tabPanel("Heterogeneity", htmlOutput("heterogeneityTextOutput")),
+              tabPanel("Leave-One-Out", htmlOutput("leaveOneOutTextOutput")),
+              tabPanel("Publication Bias", htmlOutput("publicationBiasTextOutput")),
+              tabPanel("Meta-Regression", htmlOutput("metaRegressionTextOutput")),
+              tabPanel("Cumulative Meta-Analysis", htmlOutput("cumulativeMetaTextOutput")),
+              tabPanel("Bayesian Meta-Analysis", htmlOutput("bayesianMetaTextOutput")),
+              tabPanel("Subgroup Analysis", htmlOutput("subgroupAnalysisTextOutput")),
+              tabPanel("Trim and Fill", htmlOutput("trimFillTextOutput")),
+              tabPanel("Outlier Detection", htmlOutput("outliersTextOutput")),
+              tabPanel("P-Curve Analysis", htmlOutput("pcurveTextOutput")),
+              tabPanel("Overall Summary", htmlOutput("overallSummaryTextOutput")),
+              tabPanel("Study Characteristics", htmlOutput("studyCharTextOutput")),
+              tabPanel("Study Weights", htmlOutput("studyWeightsTextOutput")),
+              tabPanel("Fixed vs Random Comparison", htmlOutput("fixedRandomTextOutput")),
+              tabPanel("Aggregated Raw", htmlOutput("rawMetaText")),
+              tabPanel("LLM Cochrane", htmlOutput("llmCochraneText")),
+              tabPanel("LLM NEJM", htmlOutput("llmNEJMText")),
+              tabPanel("LLM Lancet", htmlOutput("llmLancetText")),
+              tabPanel("LLM Plain", htmlOutput("llmPlainText"))
+            )
+          )
+        )
+      )
+    )
+  ),
+  footer = bs4DashFooter("Copyright © 2025")
+)
+
+# ---------------------------
+# Server
+# ---------------------------
+server <- function(input, output, session) {
+  
+  # Download Handlers for Sample CSV Files
+  
+  output$downloadBasic <- downloadHandler(
+    filename = function() { "basic_sample.csv" },
+    content = function(file) {
+      basic_sample <- data.frame(
+        evente = c(10, 15, 20, 25, 30),
+        totale = c(50, 60, 70, 80, 90),
+        eventc = c(5, 7, 10, 12, 15),
+        totalc = c(50, 60, 70, 80, 90),
+        author = c("StudyA", "StudyB", "StudyC", "StudyD", "StudyE")
+      )
+      write.csv(basic_sample, file, row.names = FALSE)
+    }
+  )
+  
+  output$downloadMeta <- downloadHandler(
+    filename = function() { "meta_regression_sample.csv" },
+    content = function(file) {
+      meta_sample <- data.frame(
+        evente = c(10, 15, 20, 25, 30),
+        totale = c(50, 60, 70, 80, 90),
+        eventc = c(5, 7, 10, 12, 15),
+        totalc = c(50, 60, 70, 80, 90),
+        author = c("StudyA", "StudyB", "StudyC", "StudyD", "StudyE"),
+        Reg = c(1.2, 1.5, 1.8, 1.3, 1.6),
+        Reg2 = c(2.3, 2.0, 2.5, 2.1, 2.4),
+        Reg3 = c(0.5, 0.8, 0.6, 0.7, 0.9)
+      )
+      write.csv(meta_sample, file, row.names = FALSE)
+    }
+  )
+  
+  output$downloadExtended <- downloadHandler(
+    filename = function() { "extended_sample.csv" },
+    content = function(file) {
+      extended_sample <- data.frame(
+        evente = c(10, 15, 20, 25, 30),
+        totale = c(50, 60, 70, 80, 90),
+        eventc = c(5, 7, 10, 12, 15),
+        totalc = c(50, 60, 70, 80, 90),
+        author = c("StudyA", "StudyB", "StudyC", "StudyD", "StudyE"),
+        Reg = c(1.2, 1.5, 1.8, 1.3, 1.6),
+        Reg2 = c(2.3, 2.0, 2.5, 2.1, 2.4),
+        Reg3 = c(0.5, 0.8, 0.6, 0.7, 0.9),
+        Subgroup = c("A", "B", "A", "C", "B")
+      )
+      write.csv(extended_sample, file, row.names = FALSE)
+    }
+  )
+  
+  # Reactive expression for user-uploaded data
+  dataInput <- reactive({
+    req(input$fileInput)
+    dat <- read.csv(input$fileInput$datapath)
+    # Validate that required columns exist (for basic analysis)
+    required_cols <- c("evente", "totale", "eventc", "totalc", "author")
+    if (!all(required_cols %in% names(dat))) {
+      stop("Uploaded CSV file is missing one or more required columns: ", paste(required_cols, collapse = ", "))
+    }
+    dat
+  })
+  
+  metaResult <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    metabin(event.e = dat$evente,
+            n.e = dat$totale,
+            event.c = dat$eventc,
+            n.c = dat$totalc,
+            studlab = dat$author,
+            data = dat,
+            sm = input$effectMeasure,
+            method.tau = input$method.tau,
+            common = (input$effectModel == "FE"),
+            random = (input$effectModel == "RE"))
+  })
+  
+  heterogeneityText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    if (is.null(m$Q) || !is.finite(m$I2) || is.null(m$I2)) {
+      return("Heterogeneity information is not available.")
+    }
+    k <- m$k
+    I2_val <- round(as.numeric(m$I2), 1)
+    Q_val <- round(as.numeric(m$Q), 2)
+    p_Q <- round(as.numeric(m$pval.Q), 4)
+    level <- if(I2_val < 30) "low" else if(I2_val < 60) "moderate" else if(I2_val < 75) "substantial" else "considerable"
+    paste0("Heterogeneity Summary\n\n",
+           "Number of studies: ", k, "\n",
+           "I²: ", I2_val, "%\n",
+           "Q-statistic: ", Q_val, " (p = ", p_Q, ")\n",
+           "This indicates ", level, " heterogeneity overall.")
+  })
+  
+  leaveOneOutText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    paste(capture.output(print(metainf(m))), collapse = "\n")
+  })
+  
+  publicationBiasText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    pb <- metabias(m, method.bias = "linreg")
+    paste(capture.output(print(summary(pb))), collapse = "\n")
+  })
+  
+  metaRegressionText <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    if(all(c("Reg", "Reg2", "Reg3") %in% names(dat))){
+      dat2 <- escalc(measure = input$effectMeasure,
+                     ai = dat$evente,
+                     n1i = dat$totale,
+                     ci = dat$eventc,
+                     n2i = dat$totalc,
+                     data = dat,
+                     slab = dat$author)
+      m_reg <- rma(yi = dat2$yi, vi = dat2$vi, mods = ~ Reg + Reg2 + Reg3, data = dat2, method = "REML")
+      paste(capture.output(print(summary(m_reg))), collapse = "\n")
+    } else {
+      "Meta-regression data not available."
+    }
+  })
+  
+  cumulativeMetaText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    paste(capture.output(print(metacum(m))), collapse = "\n")
+  })
+  
+  bayesianMetaText <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    if(nrow(dat) < 2) return("At least 2 studies are required for Bayesian meta-analysis.")
+    if(!requireNamespace("bayesmeta", quietly = TRUE)){
+      return("Bayesian meta-analysis function not available.")
+    }
+    dat2 <- escalc(measure = input$effectMeasure,
+                   ai = dat$evente,
+                   n1i = dat$totale,
+                   ci = dat$eventc,
+                   n2i = dat$totalc,
+                   data = dat,
+                   slab = dat$author)
+    sigma <- sqrt(dat2$vi)
+    bmeta <- bayesmeta::bayesmeta(y = dat2$yi, sigma = sigma)
+    paste(capture.output(print(summary(bmeta))), collapse = "\n")
+  })
+  
+  subgroupAnalysisText <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    if("Subgroup" %in% names(dat)){
+      m_sub <- metabin(event.e = dat$evente,
+                       n.e = dat$totale,
+                       event.c = dat$eventc,
+                       n.c = dat$totalc,
+                       studlab = dat$author,
+                       data = dat,
+                       sm = input$effectMeasure,
+                       method.tau = input$method.tau,
+                       common = (input$effectModel == "FE"),
+                       random = (input$effectModel == "RE"),
+                       subgroup = dat$Subgroup)
+      paste(capture.output(print(summary(m_sub))), collapse = "\n")
+    } else {
+      "Subgroup analysis data not available."
+    }
+  })
+  
+  trimFillText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    paste(capture.output(print(summary(trimfill(m)))), collapse = "\n")
+  })
+  
+  outliersText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    out <- tryCatch(dmetar::find.outliers(m), error = function(e) "Outlier detection not available.")
+    if(is.character(out)) return(out)
+    paste("Outlier Studies:", paste(out, collapse = ", "))
+  })
+  
+  pcurveText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    pc <- tryCatch(dmetar::pcurve(m), error = function(e) "P-curve analysis not available.")
+    paste(capture.output(print(pc)), collapse = "\n")
+  })
+  
+  overallSummaryText <- reactive({
+    req(metaResult())
+    paste(capture.output(print(summary(metaResult()))), collapse = "\n")
+  })
+  
+  studyCharText <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    paste("Study Characteristics:\n", paste(capture.output(print(dat)), collapse = "\n"))
+  })
+  
+  studyWeightsText <- reactive({
+    req(metaResult())
+    m <- metaResult()
+    if (!is.null(m$w.random)) {
+      paste("Study Weights (Random):", paste(names(m$w.random), round(m$w.random, 2), collapse = "\n"))
+    } else {
+      "Study weights not available."
+    }
+  })
+  
+  fixedRandomText <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    fixed_model <- metabin(event.e = dat$evente,
+                           n.e = dat$totale,
+                           event.c = dat$eventc,
+                           n.c = dat$totalc,
+                           studlab = dat$author,
+                           data = dat,
+                           sm = input$effectMeasure,
+                           common = TRUE,
+                           random = FALSE)
+    random_model <- metaResult()
+    txt_fixed <- paste("Fixed Effect Estimate:", round(as.numeric(fixed_model$TE.fixed), 2),
+                       "(95% CI:", round(as.numeric(fixed_model$lower.fixed), 2), "to", round(as.numeric(fixed_model$upper.fixed), 2), ")")
+    txt_random <- paste("Random Effect Estimate:", round(as.numeric(random_model$TE.random), 2),
+                        "(95% CI:", round(as.numeric(random_model$lower.random), 2), "to", round(as.numeric(random_model$upper.random), 2), ")")
+    paste("Fixed vs Random Effects Comparison:\n", txt_fixed, "\n", txt_random)
+  })
+  
+  allText <- reactive({
+    paste(
+      heterogeneityText(),
+      "\nLeave-One-Out Analysis:\n", leaveOneOutText(),
+      "\nPublication Bias:\n", publicationBiasText(),
+      "\nMeta-Regression:\n", metaRegressionText(),
+      "\nCumulative Meta-Analysis:\n", cumulativeMetaText(),
+      "\nBayesian Meta-Analysis:\n", bayesianMetaText(),
+      "\nSubgroup Analysis:\n", subgroupAnalysisText(),
+      "\nTrim and Fill Analysis:\n", trimFillText(),
+      "\nOutlier Detection:\n", outliersText(),
+      "\nP-Curve Analysis:\n", pcurveText(),
+      "\nOverall Meta-Analysis Summary:\n", overallSummaryText(),
+      "\nStudy Characteristics:\n", studyCharText(),
+      "\nStudy Weights:\n", studyWeightsText(),
+      "\nFixed vs Random Effects Comparison:\n", fixedRandomText(),
+      sep = "\n\n"
+    )
+  })
+  
+  # ---------------------------
+  # Render UI Outputs
+  # ---------------------------
+  output$heterogeneityTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", heterogeneityText()) })
+  output$leaveOneOutTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", leaveOneOutText()) })
+  output$publicationBiasTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", publicationBiasText()) })
+  output$metaRegressionTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", metaRegressionText()) })
+  output$cumulativeMetaTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", cumulativeMetaText()) })
+  output$bayesianMetaTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", bayesianMetaText()) })
+  output$subgroupAnalysisTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", subgroupAnalysisText()) })
+  output$trimFillTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", trimFillText()) })
+  output$baujatTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", "Baujat analysis removed.") })
+  output$outliersTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", outliersText()) })
+  output$pcurveTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", pcurveText()) })
+  output$overallSummaryTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", overallSummaryText()) })
+  output$studyCharTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", studyCharText()) })
+  output$studyWeightsTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", studyWeightsText()) })
+  output$fixedRandomTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", fixedRandomText()) })
+  output$rawMetaText <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", allText()) })
+  
+  # ---------------------------
+  # LLM Integration for Converted Text (4 styles)
+  # ---------------------------
+  llmResults <- reactiveValues(cochrane = "", nejm = "", lancet = "", plain = "")
+  
+  observe({
+    req(allText())
+    originalText <- allText()
+    api_keys <- c("AIzaSyDo6kED06Epfl4zZ-jrMGK0VRTlWc1AGxg",
+                  "AIzaSyCwKB0hETywXjhB9aXNPw0dBSjO8kWPgU0",
+                  "AIzaSyCmeHvCXwls2Nixhg8g2ALGlJ6ce80SOXw",
+                  "AIzaSyAydG28jErd8P2JJ76nXtDVWk-OXcFXR6c",
+                  "AIzaSyDC6Y4ZyvuesG4K0Qmht7GhAZ5RLx-d5V4",
+                  "AIzaSyAdv7S9Mmc960IsPfsbWvy6UPB11Zf43_o")
+    
+    prompt_cochrane <- paste(
+      "Rewrite the following meta-analysis results into a detailed, well-structured Cochrane-style results section. ",
+      "Include clear headings: Introduction, Methods, Results, Discussion, and Conclusion with proper line breaks. ",
+      "The output should be at least 350 words long with a detailed explanation of methodology, statistical results, and clinical implications. ",
+      "Output only the structured results section without extra metadata.\n\nOriginal Meta-Analysis Text:\n", 
+      originalText
+    )
+    key_cochrane <- sample(api_keys, 1)
+    res_cochrane <- generate_content(prompt_cochrane, key_cochrane)
+    llmResults$cochrane <- if(nzchar(res_cochrane$generated)){
+      clean_markdown(res_cochrane$generated)
+    } else "No LLM-generated content received for Cochrane style."
+    
+    prompt_nejm <- paste(
+      "Rewrite the following meta-analysis results into a detailed, formal NEJM-style description. ",
+      "Include a succinct summary, detailed statistical results, and clinical implications. ",
+      "The output should be at least 350 words long. Output only the structured results section without extra metadata.\n\nOriginal Meta-Analysis Text:\n", 
+      originalText
+    )
+    key_nejm <- sample(api_keys, 1)
+    res_nejm <- generate_content(prompt_nejm, key_nejm)
+    llmResults$nejm <- if(nzchar(res_nejm$generated)){
+      clean_markdown(res_nejm$generated)
+    } else "No LLM-generated content received for NEJM style."
+    
+    prompt_lancet <- paste(
+      "Rewrite the following meta-analysis results into a detailed, well-structured Lancet-style results section. ",
+      "Include clear headings, detailed analysis, and clinical implications. ",
+      "The output should be at least 350 words long. Output only the structured results section without extra metadata.\n\nOriginal Meta-Analysis Text:\n", 
+      originalText
+    )
+    key_lancet <- sample(api_keys, 1)
+    res_lancet <- generate_content(prompt_lancet, key_lancet)
+    llmResults$lancet <- if(nzchar(res_lancet$generated)){
+      clean_markdown(res_lancet$generated)
+    } else "No LLM-generated content received for Lancet style."
+    
+    prompt_plain <- paste(
+      "Rewrite the following meta-analysis results into a detailed plain language summary. ",
+      "The output must be easy to understand, avoid jargon, and be at least 350 words long, covering methodology, statistical details, and clinical implications. ",
+      "Output only the plain language summary without extra metadata.\n\nOriginal Meta-Analysis Text:\n", 
+      originalText
+    )
+    key_plain <- sample(api_keys, 1)
+    res_plain <- generate_content(prompt_plain, key_plain)
+    llmResults$plain <- if(nzchar(res_plain$generated)){
+      clean_markdown(res_plain$generated)
+    } else "No LLM-generated content received for Plain language style."
+  })
+  
+  output$llmCochraneText <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", llmResults$cochrane) })
+  output$llmNEJMText <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", llmResults$nejm) })
+  output$llmLancetText <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", llmResults$lancet) })
+  output$llmPlainText <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", llmResults$plain) })
+}
+
+shinyApp(ui, server)
