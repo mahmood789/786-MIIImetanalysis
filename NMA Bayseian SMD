@@ -1,0 +1,824 @@
+#
+# app.R
+#
+# If needed, install packages:
+# install.packages(c("shiny", "bs4Dash", "rjags", "coda", "ggplot2",
+#                    "igraph", "netmeta", "dmetar", "grid", "meta"))
+
+library(shiny)
+library(bs4Dash)
+library(rjags)
+library(coda)
+library(ggplot2)
+library(igraph)
+library(netmeta)
+library(dmetar)
+library(grid)
+library(meta)
+
+# -------------------------------------------------------------------------
+# 1) Helper: unify (Treatment1, Treatment2) order in network data
+# -------------------------------------------------------------------------
+unify_treat_order <- function(df, treat_levels) {
+  for (i in seq_len(nrow(df))) {
+    if (df$Treatment1[i] > df$Treatment2[i]) {
+      tmp <- df$Treatment1[i]
+      df$Treatment1[i] <- df$Treatment2[i]
+      df$Treatment2[i] <- tmp
+      # Flip the effect sign
+      df$Effect[i] <- -df$Effect[i]
+    }
+  }
+  return(df)
+}
+
+# -------------------------------------------------------------------------
+# 2) Example CSVs: (No trailing lines that break netmeta)
+# -------------------------------------------------------------------------
+# Pairwise
+pairwise_example_smd <- "Study,Effect,SE
+Study 1,0.20,0.12
+Study 2,0.15,0.10
+Study 3,0.25,0.14
+"
+
+pairwise_example_md <- "Study,Effect,SE
+Study 1,5.0,1.2
+Study 2,3.2,1.0
+Study 3,4.5,0.8
+"
+
+pairwise_example_or <- "Study,Effect,SE
+Study 1,0.18,0.10
+Study 2,0.31,0.12
+Study 3,0.20,0.09
+# Here, 'Effect' is log(OR), e.g. 0.18 ~ log(1.2)
+"
+
+pairwise_example_rr <- "Study,Effect,SE
+Study 1,0.22,0.11
+Study 2,0.40,0.15
+Study 3,0.35,0.13
+# Here, 'Effect' is log(RR), e.g. 0.40 ~ log(1.49)
+"
+
+pairwise_example_hr <- "Study,Effect,SE
+Study 1,0.30,0.12
+Study 2,0.10,0.09
+Study 3,0.45,0.14
+# Here, 'Effect' is log(HR)
+"
+
+# Network
+network_example_smd <- "Study,Treatment1,Treatment2,Effect,SE
+Study_1_1,A,B,0.15,0.11
+Study_1_2,A,B,0.22,0.10
+Study_2_1,B,C,0.18,0.15
+Study_2_2,B,C,0.30,0.14
+Study_3_1,A,C,0.10,0.13
+Study_3_2,A,C,0.20,0.14
+"
+
+network_example_md <- "Study,Treatment1,Treatment2,Effect,SE
+Study_1_1,A,B,5.0,1.2
+Study_1_2,A,B,6.2,1.1
+Study_2_1,B,C,2.1,0.8
+Study_2_2,B,C,3.0,1.2
+Study_3_1,A,C,4.0,1.0
+Study_3_2,A,C,3.5,0.9
+"
+
+network_example_or <- "Study,Treatment1,Treatment2,Effect,SE
+Study_1_1,A,B,0.10,0.10
+Study_1_2,A,B,0.25,0.12
+Study_2_1,B,C,0.35,0.14
+Study_2_2,B,C,0.28,0.13
+Study_3_1,A,C,0.05,0.11
+Study_3_2,A,C,0.15,0.10
+"
+
+network_example_rr <- "Study,Treatment1,Treatment2,Effect,SE
+Study_1_1,A,B,0.12,0.09
+Study_1_2,A,B,0.20,0.10
+Study_2_1,B,C,0.30,0.14
+Study_2_2,B,C,0.35,0.15
+Study_3_1,A,C,0.06,0.08
+Study_3_2,A,C,0.10,0.09
+"
+
+network_example_hr <- "Study,Treatment1,Treatment2,Effect,SE
+Study_1_1,A,B,0.10,0.11
+Study_1_2,A,B,0.15,0.10
+Study_2_1,B,C,0.18,0.14
+Study_2_2,B,C,0.30,0.14
+Study_3_1,A,C,0.06,0.09
+Study_3_2,A,C,0.12,0.10
+"
+
+# -------------------------------------------------------------------------
+# 3) UI
+# -------------------------------------------------------------------------
+ui <- bs4DashPage(
+  title = "786MIIBayesian Meta-Analysis",
+  
+  header = bs4DashNavbar(
+    title = "Bayesian App", 
+    skin = "light"
+  ),
+  
+  sidebar = bs4DashSidebar(
+    skin = "light",
+    collapsed = FALSE,
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Bayesian", tabName = "bayes", icon = icon("flask")),
+      bs4SidebarMenuItem("About", tabName = "about", icon = icon("info-circle"))
+    )
+  ),
+  
+  body = bs4DashBody(
+    bs4TabItems(
+      
+      # About Tab
+      bs4TabItem(tabName = "about",
+                 fluidRow(
+                   box(
+                     width = 12, status = "primary", solidHeader = TRUE,
+                     title = "About this App",
+                     p("This Shiny app demonstrates pairwise vs. network meta-analysis using JAGS, netmeta, and meta in R.")
+                   )
+                 )
+      ),
+      
+      # Bayesian Tab
+      bs4TabItem(tabName = "bayes",
+                 fluidRow(
+                   tabsetPanel(
+                     id = "bayes_subtabs",
+                     
+                     # 1) Data & Settings
+                     tabPanel(
+                       title = "Data & Settings",
+                       icon = icon("database"),
+                       
+                       fluidRow(
+                         box(
+                           width = 4, title = "Upload or Sample Data", status = "primary", solidHeader = TRUE,
+                           
+                           fileInput("file_input", "Upload CSV File", accept = ".csv"),
+                           p("Or use sample CSV:"),
+                           # Pairwise
+                           downloadButton("dl_pairwise_smd", "Pairwise SMD"),
+                           downloadButton("dl_pairwise_md",  "Pairwise MD"),
+                           downloadButton("dl_pairwise_or",  "Pairwise OR"),
+                           downloadButton("dl_pairwise_rr",  "Pairwise RR"),
+                           downloadButton("dl_pairwise_hr",  "Pairwise HR"),
+                           br(),
+                           # Network
+                           downloadButton("dl_network_smd",  "Network SMD"),
+                           downloadButton("dl_network_md",   "Network MD"),
+                           downloadButton("dl_network_or",   "Network OR"),
+                           downloadButton("dl_network_rr",   "Network RR"),
+                           downloadButton("dl_network_hr",   "Network HR"),
+                           hr(),
+                           radioButtons("analysis_type", "Analysis Type:",
+                                        choices = c("Pairwise","Network Meta-Analysis"), inline=TRUE),
+                           checkboxInput("meta_reg", "Include Meta-Regression? (Network Only)", FALSE),
+                           selectInput("summary_measure", "Summary Measure:",
+                                       choices = c("SMD","MD","Odds Ratio","Risk Ratio","Hazard Ratio"))
+                         ),
+                         
+                         box(
+                           width = 4, status = "primary", solidHeader = TRUE,
+                           title = "Priors & MCMC",
+                           numericInput("n_iter", "MCMC Iterations:", value=2000, min=500),
+                           numericInput("burnin", "Burn-in:", value=500, min=100),
+                           numericInput("mu_prior_mean", "Prior Mean (µ):", value=0),
+                           numericInput("mu_prior_sd", "Prior SD (µ):", value=1),
+                           numericInput("tau_max", "Max Uniform(0,tau):", value=5),
+                           conditionalPanel(
+                             condition = "input.analysis_type == 'Network Meta-Analysis'",
+                             selectInput("mu_index", "Parameter for ECDF Plot:",
+                                         choices = c("mu[1]","mu[2]","mu[3]"), selected="mu[1]")
+                           ),
+                           numericInput("ecdf_threshold", "ECDF Threshold:", value=0.3),
+                           br(),
+                           actionButton("run", "Run Analysis", icon=icon("play"))
+                         ),
+                         
+                         box(
+                           width = 4, status = "primary", solidHeader = TRUE,
+                           title = "Display Options",
+                           checkboxInput("show_conv", "Show Convergence Diagnostics?", value = TRUE),
+                           checkboxInput("show_raw",  "Show Raw MCMC Samples?", value = FALSE),
+                           checkboxInput("show_study_summary", "Show Study-Level Summary?", value = TRUE),
+                           checkboxInput("show_heterogeneity", "Show Heterogeneity Summary?", value = TRUE)
+                         )
+                       )
+                     ),
+                     
+                     # 2) Plots & Downloads
+                     tabPanel(
+                       title = "Plots & Downloads",
+                       icon = icon("chart-bar"),
+                       
+                       fluidRow(
+                         box(
+                           width = 4, status = "primary", solidHeader = TRUE,
+                           title = "Select Plot",
+                           radioButtons("plot_type", "Plot Type:",
+                                        choices = c(
+                                          "Traceplot" = "Traceplot",
+                                          "Density" = "Density",
+                                          "Autocorrelation" = "Autocorrelation",
+                                          "Gelman Plot" = "Gelman Plot",
+                                          "Forest Plot" = "Forest Plot",
+                                          "Funnel Plot" = "Funnel Plot",
+                                          "Caterpillar Plot" = "Caterpillar Plot",
+                                          "Residual Plot" = "Residual Plot",
+                                          "Bubble Plot" = "Bubble Plot",
+                                          "Pairs Plot" = "Pairs Plot",
+                                          "Posterior Predictive Check" = "Posterior Predictive Check",
+                                          "Network Plot" = "Network Plot",
+                                          "ECDF Plot" = "ECDF Plot",
+                                          # netdirect() removed
+                                          "Netrank Table" = "Netrank Table",
+                                          "Netheat Plot" = "Netheat Plot",
+                                          "Netsplit Forest Plot" = "Netsplit Forest Plot"
+                                        ), inline=FALSE),
+                           downloadButton("download_plot", "Download Plot as PNG")
+                         ),
+                         
+                         box(
+                           width = 8, status = "primary", solidHeader = TRUE,
+                           title = "Plot Output",
+                           plotOutput("plot", height="500px")
+                         )
+                       )
+                     ),
+                     
+                     # 3) Model Output
+                     tabPanel(
+                       title = "Model Output",
+                       icon = icon("info"),
+                       
+                       fluidRow(
+                         box(width=12, status="primary", solidHeader=TRUE,
+                             title="Bayesian Model Summary",
+                             verbatimTextOutput("textOutput"))
+                       )
+                     ),
+                     
+                     # 4) Diagnostics
+                     tabPanel(
+                       title = "Diagnostics",
+                       icon = icon("wrench"),
+                       
+                       fluidRow(
+                         box(width=6, status="primary", solidHeader=TRUE,
+                             title="Convergence Diagnostics",
+                             verbatimTextOutput("convergence")),
+                         box(width=6, status="primary", solidHeader=TRUE,
+                             title="Raw MCMC Samples (first 20)",
+                             verbatimTextOutput("rawMCMC"))
+                       )
+                     ),
+                     
+                     # 5) Summaries
+                     tabPanel(
+                       title = "Summaries",
+                       icon = icon("table"),
+                       
+                       fluidRow(
+                         box(width=6, status="primary", solidHeader=TRUE,
+                             title="Study-Level Summary",
+                             tableOutput("studySummary")),
+                         box(width=6, status="primary", solidHeader=TRUE,
+                             title="Heterogeneity Summary",
+                             verbatimTextOutput("heterogeneitySummary"))
+                       ),
+                       
+                       fluidRow(
+                         box(width=12, status="primary", solidHeader=TRUE,
+                             title="ECDF Probability Output",
+                             verbatimTextOutput("ecdfOutput"))
+                       )
+                     )
+                   )
+                 )
+      )
+    )
+  ),
+  
+  controlbar = bs4DashControlbar(),
+  footer = bs4DashFooter()
+)
+
+# -------------------------------------------------------------------------
+# 4) SERVER
+# -------------------------------------------------------------------------
+server <- function(input, output, session) {
+  
+  # We'll store the last plotted object for the download handler
+  last_plot <- reactiveVal(NULL)
+  
+  # Download handlers for the 10 CSVs
+  # Pairwise
+  output$dl_pairwise_smd <- downloadHandler(
+    filename = function() { "pairwise_smd_example.csv" },
+    content = function(file) { writeLines(pairwise_example_smd, file) }
+  )
+  output$dl_pairwise_md <- downloadHandler(
+    filename = function() { "pairwise_md_example.csv" },
+    content = function(file) { writeLines(pairwise_example_md, file) }
+  )
+  output$dl_pairwise_or <- downloadHandler(
+    filename = function() { "pairwise_or_example.csv" },
+    content = function(file) { writeLines(pairwise_example_or, file) }
+  )
+  output$dl_pairwise_rr <- downloadHandler(
+    filename = function() { "pairwise_rr_example.csv" },
+    content = function(file) { writeLines(pairwise_example_rr, file) }
+  )
+  output$dl_pairwise_hr <- downloadHandler(
+    filename = function() { "pairwise_hr_example.csv" },
+    content = function(file) { writeLines(pairwise_example_hr, file) }
+  )
+  
+  # Network
+  output$dl_network_smd <- downloadHandler(
+    filename = function() { "network_smd_example.csv" },
+    content = function(file) { writeLines(network_example_smd, file) }
+  )
+  output$dl_network_md <- downloadHandler(
+    filename = function() { "network_md_example.csv" },
+    content = function(file) { writeLines(network_example_md, file) }
+  )
+  output$dl_network_or <- downloadHandler(
+    filename = function() { "network_or_example.csv" },
+    content = function(file) { writeLines(network_example_or, file) }
+  )
+  output$dl_network_rr <- downloadHandler(
+    filename = function() { "network_rr_example.csv" },
+    content = function(file) { writeLines(network_example_rr, file) }
+  )
+  output$dl_network_hr <- downloadHandler(
+    filename = function() { "network_hr_example.csv" },
+    content = function(file) { writeLines(network_example_hr, file) }
+  )
+  
+  # Reactive storage
+  rv <- reactiveValues(
+    mcmc_samples = NULL,
+    netmeta_obj  = NULL,
+    meta_obj     = NULL,
+    network_graph = NULL,
+    sample_data  = NULL
+  )
+  
+  # If user uploads a CSV
+  observeEvent(input$file_input, {
+    req(input$file_input)
+    df <- read.csv(input$file_input$datapath, stringsAsFactors=FALSE)
+    rv$sample_data <- df
+  })
+  
+  # netmeta "sm" helper
+  get_sm_value <- function() {
+    measure <- input$summary_measure
+    if (measure == "SMD")        return("SMD")
+    if (measure == "MD")         return("MD")
+    if (measure == "Odds Ratio") return("OR")
+    if (measure == "Risk Ratio") return("RR")
+    if (measure == "Hazard Ratio") return("HR")
+    return("SMD")
+  }
+  
+  # Actually run analysis
+  observeEvent(input$run, {
+    # 1) If no user file, fallback to a sample
+    if (is.null(rv$sample_data)) {
+      if (input$analysis_type=="Pairwise") {
+        rv$sample_data <- read.csv(text=pairwise_example_smd, stringsAsFactors=FALSE)
+      } else {
+        rv$sample_data <- read.csv(text=network_example_smd, stringsAsFactors=FALSE)
+      }
+    }
+    
+    dd <- rv$sample_data
+    
+    # 2) Pairwise or Network
+    if (input$analysis_type=="Pairwise") {
+      req(c("Study","Effect","SE") %in% names(dd))
+      
+      # JAGS
+      model_str <- "
+      model {
+        for (i in 1:K) {
+          y[i] ~ dnorm(theta[i], prec_within[i])
+          theta[i] ~ dnorm(mu, prec_between)
+          prec_within[i] <- pow(SE[i], -2)
+        }
+        mu ~ dnorm(mu_prior, prec_mu)
+        tau ~ dunif(0, tau_max)
+        prec_mu <- pow(mu_prior_sd, -2)
+        prec_between <- pow(tau, -2)
+      }
+      "
+      data_list <- list(
+        y = dd$Effect,
+        SE=dd$SE,
+        K = nrow(dd),
+        mu_prior    = input$mu_prior_mean,
+        mu_prior_sd = input$mu_prior_sd,
+        tau_max     = input$tau_max
+      )
+      jm <- jags.model(textConnection(model_str), data=data_list, n.chains=3, quiet=TRUE)
+      update(jm, input$burnin)
+      samples <- coda.samples(jm, variable.names=c("mu","tau","theta"), n.iter=input$n_iter)
+      rv$mcmc_samples <- samples
+      rv$netmeta_obj  <- NULL
+      
+      # meta object
+      sm_val <- get_sm_value()
+      meta_obj <- metagen(TE=dd$Effect, seTE=dd$SE, studlab=dd$Study, sm=sm_val)
+      rv$meta_obj <- meta_obj
+      
+    } else {
+      req(c("Study","Treatment1","Treatment2","Effect","SE") %in% names(dd))
+      
+      # netmeta
+      treatments <- unique(c(dd$Treatment1, dd$Treatment2))
+      dd <- unify_treat_order(dd, treatments)
+      
+      nm_df <- data.frame(
+        TE=dd$Effect, seTE=dd$SE,
+        treat1=dd$Treatment1, treat2=dd$Treatment2,
+        studlab=dd$Study, stringsAsFactors=FALSE
+      )
+      nm_df$treat1 <- factor(nm_df$treat1, levels=treatments)
+      nm_df$treat2 <- factor(nm_df$treat2, levels=treatments)
+      
+      nm_obj <- netmeta(
+        TE=TE, seTE=seTE,
+        treat1=treat1, treat2=treat2,
+        studlab=studlab, data=nm_df,
+        sm=get_sm_value(),
+        common=TRUE, random=FALSE,
+        reference.group=treatments[1]
+      )
+      rv$netmeta_obj <- nm_obj
+      
+      # JAGS for network
+      model_str <- if (input$meta_reg) {
+        "
+        model {
+          for (i in 1:K) {
+            y[i] ~ dnorm(theta[i], prec_within[i])
+            theta[i] <- (mu[t1[i]] - mu[t2[i]]) + beta*x[i] + delta[i]
+            delta[i] ~ dnorm(0, prec_between)
+            prec_within[i] <- pow(SE[i], -2)
+          }
+          for (j in 1:T) {
+            mu[j] ~ dnorm(mu_prior, prec_mu)
+          }
+          beta ~ dnorm(0,1.0E-6)
+          tau ~ dunif(0, tau_max)
+          prec_mu <- pow(mu_prior_sd, -2)
+          prec_between <- pow(tau, -2)
+        }
+        "
+      } else {
+        "
+        model {
+          for (i in 1:K) {
+            y[i] ~ dnorm(theta[i], prec_within[i])
+            theta[i] <- (mu[t1[i]] - mu[t2[i]]) + delta[i]
+            delta[i] ~ dnorm(0, prec_between)
+            prec_within[i] <- pow(SE[i], -2)
+          }
+          for (j in 1:T) {
+            mu[j] ~ dnorm(mu_prior, prec_mu)
+          }
+          tau ~ dunif(0, tau_max)
+          prec_mu <- pow(mu_prior_sd, -2)
+          prec_between <- pow(tau, -2)
+        }
+        "
+      }
+      
+      data_list <- list(
+        y=dd$Effect,
+        SE=dd$SE,
+        x=if(input$meta_reg) rnorm(nrow(dd),0,1) else rep(0,nrow(dd)),
+        K=nrow(dd),
+        T=length(treatments),
+        t1=match(dd$Treatment1, treatments),
+        t2=match(dd$Treatment2, treatments),
+        mu_prior=input$mu_prior_mean,
+        mu_prior_sd=input$mu_prior_sd,
+        tau_max=input$tau_max
+      )
+      jm <- jags.model(textConnection(model_str), data=data_list, n.chains=3, quiet=TRUE)
+      update(jm, input$burnin)
+      vars <- if(input$meta_reg) c("mu","tau","beta","theta") else c("mu","tau","theta")
+      samples <- coda.samples(jm, variable.names=vars, n.iter=input$n_iter)
+      rv$mcmc_samples <- samples
+      
+      # Network graph
+      edges <- as.data.frame(table(dd$Treatment1, dd$Treatment2))
+      names(edges) <- c("from","to","Freq")
+      edges <- edges[edges$Freq>0,]
+      g <- graph_from_data_frame(edges, directed=FALSE, vertices=data.frame(name=treatments))
+      rv$network_graph <- g
+      rv$meta_obj <- NULL
+    }
+  })
+  
+  storeBasePlot <- function() {
+    bp <- recordPlot()
+    last_plot(bp)
+  }
+  
+  # Plot logic
+  output$plot <- renderPlot({
+    req(rv$mcmc_samples)
+    pt <- input$plot_type
+    
+    if (pt == "Traceplot") {
+      traceplot(rv$mcmc_samples)
+      storeBasePlot()
+    } else if (pt == "Density") {
+      densplot(rv$mcmc_samples, main="Density of MCMC Samples")
+      storeBasePlot()
+    } else if (pt == "Autocorrelation") {
+      autocorr.plot(rv$mcmc_samples, lag.max=50)
+      storeBasePlot()
+    } else if (pt == "Gelman Plot") {
+      gelman.plot(rv$mcmc_samples, auto.layout=FALSE)
+      storeBasePlot()
+    } else if (pt == "Forest Plot") {
+      if (input$analysis_type=="Pairwise" && !is.null(rv$meta_obj)) {
+        forest(rv$meta_obj, comb.fixed=FALSE, comb.random=TRUE)
+        storeBasePlot()
+      } else if (input$analysis_type=="Network Meta-Analysis" && !is.null(rv$netmeta_obj)) {
+        forest(rv$netmeta_obj)
+        storeBasePlot()
+      } else {
+        plot.new(); text(0.5,0.5,"No meta object for Forest Plot")
+        storeBasePlot()
+      }
+    } else if (pt == "Funnel Plot") {
+      if (input$analysis_type=="Pairwise" && !is.null(rv$meta_obj)) {
+        funnel(rv$meta_obj)
+        storeBasePlot()
+      } else if (input$analysis_type=="Network Meta-Analysis" && !is.null(rv$netmeta_obj)) {
+        funnel(rv$netmeta_obj, order=rv$netmeta_obj$trts)
+        storeBasePlot()
+      } else {
+        plot.new(); text(0.5,0.5,"No meta object for Funnel Plot")
+        storeBasePlot()
+      }
+    } else if (pt == "Caterpillar Plot") {
+      mat <- as.matrix(rv$mcmc_samples)
+      tn <- grep("^theta\\[", colnames(mat), value=TRUE)
+      if(length(tn)==0) {
+        plot.new(); text(0.5,0.5,"No 'theta' for Caterpillar")
+        storeBasePlot()
+      } else {
+        submat <- mat[,tn, drop=FALSE]
+        means <- apply(submat,2,mean)
+        lower <- apply(submat,2,function(x) quantile(x,0.025))
+        upper <- apply(submat,2,function(x) quantile(x,0.975))
+        n <- length(means)
+        plot(means, 1:n, pch=19,
+             xlab="Posterior Mean", ylab="Study",
+             xlim=c(min(lower), max(upper)),
+             main="Caterpillar Plot")
+        segments(x0=lower, x1=upper, y0=1:n, y1=1:n)
+        abline(v=0, col="red", lty=2)
+        storeBasePlot()
+      }
+    } else if (pt == "Residual Plot") {
+      mat <- as.matrix(rv$mcmc_samples)
+      tn <- grep("^theta\\[", colnames(mat), value=TRUE)
+      if(length(tn)==0) {
+        plot.new(); text(0.5,0.5,"No 'theta' found")
+        storeBasePlot()
+      } else {
+        means <- colMeans(mat[,tn])
+        obs <- rv$sample_data$Effect
+        residuals <- obs - means
+        plot(means, residuals, pch=19,
+             xlab="Predicted Theta", ylab="Residual",
+             main="Residual Plot")
+        abline(h=0, col="red")
+        storeBasePlot()
+      }
+    } else if (pt == "Bubble Plot") {
+      dd <- rv$sample_data
+      symbols(dd$Effect, dd$SE, circles=1/(dd$SE+1e-6), inches=0.15,
+              fg="blue", bg=rgb(0,0,1,0.3),
+              xlab="Effect Size", ylab="Standard Error",
+              main="Bubble Plot")
+      storeBasePlot()
+    } else if (pt == "Pairs Plot") {
+      pairs(as.matrix(rv$mcmc_samples), pch=".")
+      storeBasePlot()
+    } else if (pt == "Posterior Predictive Check") {
+      plot.new(); text(0.5,0.5,"Not implemented.")
+      storeBasePlot()
+    } else if (pt == "Network Plot") {
+      if (input$analysis_type=="Network Meta-Analysis" && !is.null(rv$network_graph)) {
+        plot(rv$network_graph, vertex.size=30, main="Network Plot")
+        storeBasePlot()
+      } else {
+        plot.new(); text(0.5,0.5,"No network graph or not network analysis")
+        storeBasePlot()
+      }
+    } else if (pt == "ECDF Plot") {
+      mat <- as.matrix(rv$mcmc_samples)
+      if (input$analysis_type=="Pairwise") {
+        if(!("mu" %in% colnames(mat))) {
+          plot.new(); text(0.5,0.5,"No 'mu' in MCMC")
+          storeBasePlot()
+        } else {
+          x <- mat[,"mu"]
+          plot(ecdf(x), main="ECDF of mu", xlab="mu")
+          abline(v=input$ecdf_threshold, col="red", lty=2)
+          storeBasePlot()
+        }
+      } else {
+        param <- input$mu_index
+        if(!(param %in% colnames(mat))) {
+          plot.new(); text(0.5,0.5,paste("No", param))
+          storeBasePlot()
+        } else {
+          x <- mat[,param]
+          plot(ecdf(x), main=paste("ECDF of", param), xlab=param)
+          abline(v=input$ecdf_threshold, col="red", lty=2)
+          storeBasePlot()
+        }
+      }
+    } else if (pt == "Netrank Table") {
+      if (input$analysis_type=="Network Meta-Analysis" && !is.null(rv$netmeta_obj)) {
+        netrank(rv$netmeta_obj)
+        storeBasePlot()
+      } else {
+        plot.new(); text(0.5,0.5,"Netrank only for netmeta.")
+        storeBasePlot()
+      }
+    } else if (pt == "Netheat Plot") {
+      if (input$analysis_type=="Network Meta-Analysis" && !is.null(rv$netmeta_obj)) {
+        netheat(rv$netmeta_obj)
+        storeBasePlot()
+      } else {
+        plot.new(); text(0.5,0.5,"Netheat only for netmeta.")
+        storeBasePlot()
+      }
+    } else if (pt == "Netsplit Forest Plot") {
+      if (input$analysis_type=="Network Meta-Analysis" && !is.null(rv$netmeta_obj)) {
+        ns <- netsplit(rv$netmeta_obj)
+        forest(ns)
+        storeBasePlot()
+      } else {
+        plot.new(); text(0.5,0.5,"Netsplit only for netmeta.")
+        storeBasePlot()
+      }
+    } else {
+      plot.new()
+      text(0.5,0.5,"No plot selected.")
+      storeBasePlot()
+    }
+  })
+  
+  # Download the last plot
+  output$download_plot <- downloadHandler(
+    filename = function() { paste0("meta_plot_", Sys.Date(), ".png") },
+    content = function(file) {
+      p <- last_plot()
+      if (is.null(p)) {
+        png(file)
+        plot.new(); text(0.5,0.5,"No last plot found.")
+        dev.off()
+      } else if (inherits(p, "recordedplot")) {
+        png(file, width=900, height=600)
+        replayPlot(p)
+        dev.off()
+      } else {
+        png(file)
+        plot.new(); text(0.5,0.5,"Unknown plot type.")
+        dev.off()
+      }
+    }
+  )
+  
+  # Model summary
+  output$textOutput <- renderPrint({
+    req(rv$mcmc_samples)
+    s <- summary(rv$mcmc_samples)
+    e <- effectiveSize(rv$mcmc_samples)
+    cat("Model Summary:\n")
+    print(s)
+    cat("\nEffective Sample Sizes:\n")
+    print(e)
+    cat("\nSummary Measure:", input$summary_measure,"\n")
+    
+    if (input$analysis_type=="Network Meta-Analysis") {
+      cat("Network meta-analysis.\n")
+      if(input$meta_reg) cat("Meta-regression is included.\n")
+    } else {
+      cat("Pairwise meta-analysis.\n")
+    }
+  })
+  
+  # Convergence
+  output$convergence <- renderPrint({
+    req(rv$mcmc_samples)
+    if(!input$show_conv) {
+      cat("Convergence diagnostics hidden.")
+      return()
+    }
+    cat("Gelman-Rubin Diagnostic:\n")
+    print(gelman.diag(rv$mcmc_samples, autoburnin=FALSE))
+    cat("\nGeweke Diagnostic:\n")
+    print(geweke.diag(rv$mcmc_samples))
+  })
+  
+  # Raw MCMC
+  output$rawMCMC <- renderPrint({
+    req(rv$mcmc_samples)
+    if(!input$show_raw) {
+      cat("Raw MCMC samples not shown.")
+      return()
+    }
+    head(as.matrix(rv$mcmc_samples), 20)
+  })
+  
+  # Study-level summary
+  output$studySummary <- renderTable({
+    req(rv$mcmc_samples)
+    if(!input$show_study_summary) return()
+    
+    mat <- as.matrix(rv$mcmc_samples)
+    tn <- grep("^theta\\[", colnames(mat), value=TRUE)
+    if(length(tn)==0) return()
+    submat <- mat[,tn, drop=FALSE]
+    
+    summ <- t(apply(submat, 2, function(x){
+      c(Mean=mean(x), SD=sd(x),
+        `2.5%`=quantile(x,0.025),
+        `50%`=quantile(x,0.5),
+        `97.5%`=quantile(x,0.975))
+    }))
+    df <- data.frame(Study=rv$sample_data$Study, summ)
+    df$Residual <- rv$sample_data$Effect - df$Mean
+    df
+  })
+  
+  # Heterogeneity summary
+  output$heterogeneitySummary <- renderPrint({
+    req(rv$mcmc_samples)
+    if(!input$show_heterogeneity) {
+      cat("Heterogeneity summary not selected.")
+      return()
+    }
+    mat <- as.matrix(rv$mcmc_samples)
+    if(!("tau" %in% colnames(mat))) {
+      cat("No 'tau' found in MCMC.")
+      return()
+    }
+    tv <- mat[,"tau"]
+    tm <- mean(tv); tsd <- sd(tv)
+    tsq <- mean(tv^2)
+    avg_within <- mean(rv$sample_data$SE^2)
+    i2 <- 100*(tsq / (tsq + avg_within))
+    cat("Heterogeneity:\n")
+    cat("Mean(tau)=", tm, "\nSD(tau)=", tsd, "\nMean(tau^2)=", tsq, "\nI^2 ~", i2,"%\n")
+  })
+  
+  # ECDF Probability Output
+  output$ecdfOutput <- renderPrint({
+    req(rv$mcmc_samples)
+    mat <- as.matrix(rv$mcmc_samples)
+    if(input$analysis_type=="Pairwise") {
+      if(!("mu" %in% colnames(mat))) {
+        cat("No mu in MCMC.")
+        return()
+      }
+      x <- mat[,"mu"]
+      ec <- ecdf(x)
+      cat("Prob(mu < ", input$ecdf_threshold, "): ", ec(input$ecdf_threshold), "\n")
+    } else {
+      param <- input$mu_index
+      if(!(param %in% colnames(mat))) {
+        cat("Param",param,"not found.")
+        return()
+      }
+      x <- mat[,param]
+      ec <- ecdf(x)
+      cat("Prob(", param, "<", input$ecdf_threshold, "): ", ec(input$ecdf_threshold), "\n")
+    }
+  })
+}
+
+shinyApp(ui, server)
