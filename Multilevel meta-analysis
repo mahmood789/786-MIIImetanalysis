@@ -1,0 +1,751 @@
+# app.R
+
+# This Shiny app demonstrates an advanced multilevel meta-analysis using the metafor package.
+# It supports both two-level and three-level models.
+#
+# In a multilevel meta-analysis, the goal is to account for dependencies between effect sizes.
+# A three-level meta-analysis models variance at three levels:
+#   1. Sampling error (within-study variability)
+#   2. Between-study variance
+#   3. Additional variance (e.g., multiple effect sizes from the same study)
+#
+# A two-level model only accounts for within-study and between-study variance.
+#
+# Data Preparation:
+#   - Your CSV file should include the following columns:
+#       • z: The effect size (e.g., standardized mean difference)
+#       • var.z: The variance (or standard error squared) for the effect size
+#       • author: A study identifier (often the first author's name)
+#       • es.id: A unique identifier for each effect size (useful if a study contributes multiple effect sizes)
+#   - For filtering in this demo, we also use:
+#       • factorVar: A categorical variable (e.g., study design or treatment group). In this demo, it is created from the 'radiation' column.
+#       • numVar: A numeric variable (e.g., publication year). Here, it is extracted from the data.
+#   - If your dataset uses different column names, rename your columns or modify the code accordingly.
+#
+# Usage Notes:
+#   - Large datasets may take up to 10 minutes to display plots due to the computational complexity.
+#   - Moderator analysis is performed using the factorVar column. If your data lacks this column, moderator analysis will not run.
+#   - All outputs (plots, summaries, and reports) can be downloaded directly from the app.
+#
+# Warnings:
+#   - If only a single level exists for any random effect (e.g., only one study), a warning will be shown and the corresponding variance is fixed to 0.
+
+library(shiny)
+library(bs4Dash)
+library(metafor)
+library(dmetar)
+library(stringr)
+library(rmarkdown)
+
+# -------------------------------
+# EXAMPLE DATA PREPARATION
+# -------------------------------
+data("Chernobyl")
+
+# For demonstration, we create generic filtering columns:
+if (!"factorVar" %in% colnames(Chernobyl)) {
+  Chernobyl$factorVar <- Chernobyl$radiation
+}
+if (!"numVar" %in% colnames(Chernobyl)) {
+  if (!"year" %in% colnames(Chernobyl)) {
+    Chernobyl$year <- as.numeric(str_extract(Chernobyl$author, "[0-9]{4}"))
+  }
+  Chernobyl$numVar <- Chernobyl$year
+}
+
+# -------------------------------
+# UI
+# -------------------------------
+ui <- bs4DashPage(
+  header = bs4DashNavbar(title = "Multilevel Meta-Analysis App"),
+  sidebar = bs4DashSidebar(
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Home", tabName = "home", icon = icon("home")),
+      bs4SidebarMenuItem("Analysis", tabName = "analysis", icon = icon("chart-line")),
+      bs4SidebarMenuItem("About", tabName = "about", icon = icon("info"))
+    )
+  ),
+  body = bs4DashBody(
+    bs4TabItems(
+      # Home Tab
+      bs4TabItem(
+        tabName = "home",
+        fluidRow(
+          bs4Card(
+            title = "Welcome",
+            width = 12,
+            "This advanced Shiny app for multilevel meta-analysis demonstrates multiple outputs using example data.
+Use the 'Analysis' tab to filter data, choose model options, customize plots, run analyses, and view detailed results and reports."
+          )
+        )
+      ),
+      # Analysis Tab: Contains data/model/plot options and a Results card with sub-tabs.
+      bs4TabItem(
+        tabName = "analysis",
+        fluidRow(
+          bs4Card(
+            title = "Data Options",
+            width = 12,
+            helpText("NOTE: If your uploaded dataset does not have 'factorVar' or 'numVar', 
+                     you can ignore these filters or rename your columns. For large datasets, plots may take up to 10 minutes to display."),
+            selectInput("factorFilter", "Select Factor(s):",
+                        choices = c("All", unique(Chernobyl$factorVar)),
+                        selected = "All", multiple = TRUE),
+            sliderInput("numRange", "Numeric Filter Range:",
+                        min = min(Chernobyl$numVar, na.rm = TRUE),
+                        max = max(Chernobyl$numVar, na.rm = TRUE),
+                        value = c(min(Chernobyl$numVar, na.rm = TRUE), 
+                                  max(Chernobyl$numVar, na.rm = TRUE))),
+            fileInput("dataUpload", "Or Upload Your Data (CSV)", accept = ".csv"),
+            downloadButton("downloadExampleCSV", "Download Example CSV")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = "Model & Plot Options",
+            width = 12,
+            selectInput("modelType", "Select Model Type:",
+                        choices = c("Three-Level Model", "Two-Level Model"),
+                        selected = "Three-Level Model"),
+            checkboxInput("includeMod", "Include Moderator Analysis (factorVar)", FALSE),
+            checkboxInput("includeCum", "Include Cumulative Analysis", FALSE),
+            conditionalPanel(
+              condition = "input.includeCum == true",
+              selectInput("cumulOrder", "Select Cumulative Order:",
+                          choices = c("Alphabetical", "Random"),
+                          selected = "Alphabetical")
+            ),
+            checkboxInput("compareModels", "Run Model Comparison (Both Models)", FALSE),
+            selectInput("plotColor", "Select Plot Color:",
+                        choices = c("Default", "Blue", "Green", "Red"),
+                        selected = "Default"),
+            actionButton("runModel", "Run Analysis")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = "Results",
+            width = 12,
+            tabsetPanel(
+              # First sub-tab: Overview with detailed instructions.
+              tabPanel("Overview",
+                       HTML("
+                  <h4>Meta-Analysis Overview</h4>
+                  <p>This app demonstrates an advanced multilevel meta-analysis approach. Here are some key points and guidelines:</p>
+                  <h5>Meta-Analysis Type:</h5>
+                  <ul>
+                    <li><strong>Multilevel Meta-Analysis:</strong> This approach models variance at several levels.</li>
+                    <li>In a <strong>three-level model</strong>, we account for:
+                      <ol>
+                        <li>Sampling error (within-study variability)</li>
+                        <li>Between-study variance</li>
+                        <li>Additional variance (e.g., multiple effect sizes from the same study)</li>
+                      </ol>
+                    </li>
+                    <li>In a <strong>two-level model</strong>, only the within-study and between-study variances are estimated.</li>
+                    <li>The model is implemented using the <code>rma.mv</code> function from the <em>metafor</em> package.</li>
+                    <li>If the model detects only a single level for any random effect (e.g., only one study), a warning is shown and the corresponding variance is fixed to 0.</li>
+                  </ul>
+                  <h5>Data Preparation:</h5>
+                  <ul>
+                    <li>Your CSV file should include the following columns:
+                      <ul>
+                        <li><strong>z:</strong> The effect size (e.g., standardized mean difference).</li>
+                        <li><strong>var.z:</strong> The variance (or standard error squared) associated with the effect size.</li>
+                        <li><strong>author:</strong> A study identifier (often the first author's name).</li>
+                        <li><strong>es.id:</strong> A unique identifier for each effect size. This is useful when studies contribute multiple effect sizes.</li>
+                      </ul>
+                    </li>
+                    <li>For filtering purposes, this demo uses:
+                      <ul>
+                        <li><strong>factorVar:</strong> A categorical variable (e.g., study design, treatment group). In this demo, it is created from the 'radiation' column.</li>
+                        <li><strong>numVar:</strong> A numeric variable (e.g., publication year). Here, it is extracted from the data.</li>
+                      </ul>
+                    </li>
+                    <li>If your dataset uses different column names, you should either rename your columns to match or modify the code accordingly.</li>
+                  </ul>
+                  <h5>Usage Notes:</h5>
+                  <ul>
+                    <li>Large datasets may take up to 10 minutes to display plots due to the computational complexity of the meta-analysis.</li>
+                    <li>Moderator analysis is performed using the <code>factorVar</code> column. If your data lacks this column, the moderator analysis will not run.</li>
+                    <li>All outputs (plots, summaries, and reports) can be downloaded directly from the app.</li>
+                    <li>Please ensure your data is prepared as described to obtain valid and meaningful results from the meta-analysis.</li>
+                  </ul>
+                ")
+              ),
+              tabPanel("Model Summary", verbatimTextOutput("modelSummary")),
+              tabPanel("Forest Plot",
+                       plotOutput("forestPlot"),
+                       downloadButton("downloadForestPlot", "Download Forest Plot")
+              ),
+              tabPanel("Funnel Plot",
+                       plotOutput("funnelPlot"),
+                       downloadButton("downloadFunnelPlot", "Download Funnel Plot")
+              ),
+              tabPanel("Leave-One-Out",
+                       plotOutput("looPlot"),
+                       downloadButton("downloadLooPlot", "Download Leave-One-Out Plot")
+              ),
+              tabPanel("Cumulative Analysis", conditionalPanel(
+                condition = "input.includeCum == true",
+                plotOutput("cumulPlot"),
+                downloadButton("downloadCumulPlot", "Download Cumulative Plot")
+              )),
+              tabPanel("QQ Plot",
+                       plotOutput("qqPlot"),
+                       downloadButton("downloadQQPlot", "Download QQ Plot")
+              ),
+              tabPanel("Histogram",
+                       plotOutput("histPlot"),
+                       downloadButton("downloadHistPlot", "Download Histogram")
+              ),
+              tabPanel("Box Plot",
+                       plotOutput("boxPlot"),
+                       downloadButton("downloadBoxPlot", "Download Box Plot")
+              ),
+              tabPanel("Model Comparison", conditionalPanel(
+                condition = "input.compareModels == true",
+                tableOutput("modelCompTable")
+              )),
+              tabPanel("Diagnostics",
+                       verbatimTextOutput("diagnosticsText"),
+                       downloadButton("downloadSummary", "Download Text Summary")
+              ),
+              tabPanel("Moderator Analysis", conditionalPanel(
+                condition = "input.includeMod == true",
+                verbatimTextOutput("modSummary")
+              )),
+              tabPanel("Detailed Report",
+                       verbatimTextOutput("detailedReport"),
+                       downloadButton("downloadReport", "Download HTML Report")
+              )
+            )
+          )
+        )
+      ),
+      # About Tab: Detailed explanation in a nicely formatted card.
+      bs4TabItem(
+        tabName = "about",
+        fluidRow(
+          bs4Card(
+            title = "About This App & Meta-Analysis Methodology",
+            width = 12,
+            HTML("
+              <h4>Meta-Analysis Overview</h4>
+              <p>This app demonstrates an advanced multilevel meta-analysis approach. Here are some key points and guidelines:</p>
+              <h5>Meta-Analysis Type:</h5>
+              <ul>
+                <li><strong>Multilevel Meta-Analysis:</strong> This approach models variance at several levels.</li>
+                <li>In a <strong>three-level model</strong>, we account for:
+                  <ol>
+                    <li>Sampling error (within-study variability)</li>
+                    <li>Between-study variance</li>
+                    <li>Additional variance (e.g., multiple effect sizes from the same study)</li>
+                  </ol>
+                </li>
+                <li>In a <strong>two-level model</strong>, only the within-study and between-study variances are estimated.</li>
+                <li>The model is implemented using the <code>rma.mv</code> function from the <em>metafor</em> package.</li>
+                <li>If the model detects only a single level for any random effect (e.g., only one study), a warning is shown and the corresponding variance is fixed to 0.</li>
+              </ul>
+              <h5>Data Preparation:</h5>
+              <ul>
+                <li>Your CSV file should include the following columns:
+                  <ul>
+                    <li><strong>z:</strong> The effect size (e.g., standardized mean difference).</li>
+                    <li><strong>var.z:</strong> The variance (or standard error squared) associated with the effect size.</li>
+                    <li><strong>author:</strong> A study identifier (often the first author's name).</li>
+                    <li><strong>es.id:</strong> A unique identifier for each effect size. This is useful when studies contribute multiple effect sizes.</li>
+                  </ul>
+                </li>
+                <li>For filtering purposes, this demo uses:
+                  <ul>
+                    <li><strong>factorVar:</strong> A categorical variable (e.g., study design, treatment group). In this demo, it is created from the 'radiation' column.</li>
+                    <li><strong>numVar:</strong> A numeric variable (e.g., publication year). Here, it is extracted from the data.</li>
+                  </ul>
+                </li>
+                <li>If your dataset uses different column names, you should either rename your columns to match or modify the code accordingly.</li>
+              </ul>
+              <h5>Usage Notes:</h5>
+              <ul>
+                <li>Large datasets may take up to 10 minutes to display plots due to the computational complexity of the meta-analysis.</li>
+                <li>Moderator analysis is performed using the <code>factorVar</code> column. If your data lacks this column, the moderator analysis will not run.</li>
+                <li>All outputs (plots, summaries, and reports) can be downloaded directly from the app.</li>
+                <li>Please ensure your data is prepared as described to obtain valid and meaningful results from the meta-analysis.</li>
+              </ul>
+            ")
+          )
+        )
+      )
+    )
+  )
+)
+
+# -------------------------------
+# SERVER
+# -------------------------------
+server <- function(input, output, session) {
+  
+  # Reactive dataset: use uploaded data if provided; otherwise, use the example dataset
+  dataset <- reactive({
+    if (!is.null(input$dataUpload)) {
+      df <- read.csv(input$dataUpload$datapath, stringsAsFactors = FALSE)
+      return(df)
+    } else {
+      df <- Chernobyl
+      if ("factorVar" %in% colnames(df)) {
+        if (!("All" %in% input$factorFilter) && length(input$factorFilter) > 0) {
+          df <- df[df$factorVar %in% input$factorFilter, ]
+        }
+      }
+      if ("numVar" %in% colnames(df)) {
+        df <- df[!is.na(df$numVar) & df$numVar >= input$numRange[1] & df$numVar <= input$numRange[2], ]
+      }
+      return(df)
+    }
+  })
+  
+  # Download Example CSV
+  output$downloadExampleCSV <- downloadHandler(
+    filename = function() { "example_data.csv" },
+    content = function(file) { write.csv(Chernobyl, file, row.names = FALSE) }
+  )
+  
+  # Reactive for plot color
+  getPlotColor <- reactive({
+    switch(input$plotColor,
+           "Blue" = "blue",
+           "Green" = "green",
+           "Red" = "red",
+           "Default" = "black")
+  })
+  
+  # Main model reactive expression.
+  modelResult <- eventReactive(input$runModel, {
+    df <- dataset()
+    if (input$modelType == "Three-Level Model") {
+      rma.mv(yi = z, V = var.z, slab = author,
+             data = df,
+             random = ~ 1 | author/es.id, test = "t", method = "REML")
+    } else {
+      rma.mv(yi = z, V = var.z, slab = author,
+             data = df,
+             random = ~ 1 | author, test = "t", method = "REML")
+    }
+  })
+  
+  # Moderator model reactive expression.
+  moderatorResult <- eventReactive({
+    input$runModel; input$includeMod
+  }, {
+    df <- dataset()
+    if (input$includeMod && "factorVar" %in% colnames(df)) {
+      rma.mv(yi = z, V = var.z, slab = author,
+             data = df,
+             random = ~ 1 | author/es.id, mods = ~ factorVar,
+             test = "t", method = "REML")
+    } else {
+      NULL
+    }
+  })
+  
+  # Model Comparison
+  modelComparison <- eventReactive(input$runModel, {
+    df <- dataset()
+    model3 <- try(rma.mv(yi = z, V = var.z, slab = author,
+                         data = df, random = ~ 1 | author/es.id,
+                         test = "t", method = "REML"), silent = TRUE)
+    model2 <- try(rma.mv(yi = z, V = var.z, slab = author,
+                         data = df, random = ~ 1 | author,
+                         test = "t", method = "REML"), silent = TRUE)
+    if (inherits(model3, "try-error") || inherits(model2, "try-error")) {
+      return(NULL)
+    } else {
+      data.frame(
+        Model = c("Three-Level", "Two-Level"),
+        AIC = c(AIC(model3), AIC(model2)),
+        BIC = c(BIC(model3), BIC(model2))
+      )
+    }
+  })
+  
+  # Leave-One-Out Analysis
+  looEstimates <- reactive({
+    req(modelResult())
+    df <- dataset()
+    authors <- unique(df$author)
+    estVec <- numeric(length(authors))
+    seVec <- numeric(length(authors))
+    for (i in seq_along(authors)) {
+      subData <- df[df$author != authors[i], ]
+      tempModel <- try({
+        if (input$modelType == "Three-Level Model") {
+          rma.mv(yi = z, V = var.z, slab = author,
+                 data = subData, random = ~ 1 | author/es.id,
+                 test = "t", method = "REML")
+        } else {
+          rma.mv(yi = z, V = var.z, slab = author,
+                 data = subData, random = ~ 1 | author,
+                 test = "t", method = "REML")
+        }
+      }, silent = TRUE)
+      if (inherits(tempModel, "try-error")) {
+        estVec[i] <- NA
+        seVec[i] <- NA
+      } else {
+        estVec[i] <- coef(tempModel)
+        seVec[i] <- tempModel$se
+      }
+    }
+    data.frame(author = authors, estimate = estVec, se = seVec)
+  })
+  
+  output$looPlot <- renderPlot({
+    req(looEstimates())
+    dat <- looEstimates()
+    dat <- dat[!is.na(dat$estimate), ]
+    plot(dat$estimate, type = "b", pch = 19,
+         xlab = "Leave-One-Out (Study Index)",
+         ylab = "Pooled Estimate (z)",
+         main = input$looTitle,
+         col = getPlotColor(), lwd = 2)
+    abline(h = coef(modelResult()), col = "gray", lty = 2)
+    text(seq_along(dat$estimate), dat$estimate,
+         labels = dat$author, pos = 3, cex = 0.8, col = getPlotColor())
+  })
+  
+  # Cumulative Analysis
+  cumulEstimates <- reactive({
+    req(modelResult())
+    df <- dataset()
+    authors <- unique(df$author)
+    if (input$cumulOrder == "Alphabetical") {
+      authors <- sort(authors)
+    } else if (input$cumulOrder == "Random") {
+      set.seed(123)
+      authors <- sample(authors)
+    }
+    estVec <- numeric(length(authors))
+    seVec <- numeric(length(authors))
+    for (i in seq_along(authors)) {
+      current <- authors[1:i]
+      subData <- df[df$author %in% current, ]
+      tempModel <- try({
+        if (input$modelType == "Three-Level Model") {
+          rma.mv(yi = z, V = var.z, slab = author,
+                 data = subData, random = ~ 1 | author/es.id,
+                 test = "t", method = "REML")
+        } else {
+          rma.mv(yi = z, V = var.z, slab = author,
+                 data = subData, random = ~ 1 | author,
+                 test = "t", method = "REML")
+        }
+      }, silent = TRUE)
+      if (inherits(tempModel, "try-error")) {
+        estVec[i] <- NA
+        seVec[i] <- NA
+      } else {
+        estVec[i] <- coef(tempModel)
+        seVec[i] <- tempModel$se
+      }
+    }
+    data.frame(cumIndex = 1:length(authors), author = authors,
+               estimate = estVec, se = seVec)
+  })
+  
+  output$cumulPlot <- renderPlot({
+    req(cumulEstimates())
+    dat <- cumulEstimates()
+    plot(dat$cumIndex, dat$estimate, type = "b", pch = 19,
+         xlab = "Number of Studies Included",
+         ylab = "Pooled Estimate (z)",
+         main = input$cumulTitle,
+         col = getPlotColor(), lwd = 2, ylim = range(dat$estimate, na.rm = TRUE))
+    arrows(dat$cumIndex, dat$estimate - 1.96 * dat$se,
+           dat$cumIndex, dat$estimate + 1.96 * dat$se,
+           angle = 90, code = 3, length = 0.05, col = getPlotColor())
+  })
+  
+  # Other Plots
+  output$forestPlot <- renderPlot({
+    req(modelResult())
+    forest(modelResult(), main = input$forestTitle, col = getPlotColor())
+  })
+  
+  output$funnelPlot <- renderPlot({
+    req(modelResult())
+    funnel(modelResult(), main = input$funnelTitle, col = getPlotColor())
+  })
+  
+  output$qqPlot <- renderPlot({
+    req(modelResult())
+    qqnorm(resid(modelResult()), main = input$qqTitle, col = getPlotColor())
+    qqline(resid(modelResult()), col = getPlotColor())
+  })
+  
+  output$histPlot <- renderPlot({
+    hist(dataset()$z, col = getPlotColor(),
+         main = input$histTitle, xlab = "Effect Size (z)")
+  })
+  
+  output$boxPlot <- renderPlot({
+    df <- dataset()
+    if ("factorVar" %in% colnames(df)) {
+      boxplot(z ~ factorVar, data = df, col = getPlotColor(),
+              main = input$boxTitle, xlab = "Factor Levels",
+              ylab = "Effect Size (z)")
+    } else {
+      plot(1, 1, type = "n", axes = FALSE, xlab = "", ylab = "",
+           main = "factorVar not found in dataset.<br>Cannot draw Box Plot.")
+    }
+  })
+  
+  # Model Summary & Diagnostics
+  output$modelSummary <- renderPrint({
+    req(modelResult())
+    cat("=== Model Summary ===\n")
+    print(summary(modelResult()))
+    heterogeneity <- modelResult()$sigma2
+    if (!is.null(heterogeneity)) {
+      cat("\nHeterogeneity Variance Components:\n")
+      print(heterogeneity)
+    }
+  })
+  
+  output$diagnosticsText <- renderPrint({
+    req(modelResult())
+    mod_obj <- modelResult()
+    cat("=== Diagnostic Statistics ===\n")
+    if (!is.null(mod_obj$QE)) {
+      cat("Test for heterogeneity (Q-test):\n")
+      cat("  Q =", round(mod_obj$QE, 2), "\n")
+      df_val <- mod_obj$k - mod_obj$p
+      cat("  Degrees of freedom =", df_val, "\n")
+      cat("  p-value =", mod_obj$QEp, "\n")
+    }
+    cat("\nHeterogeneity Variance Components:\n")
+    print(mod_obj$sigma2)
+    cat("\nNumber of studies:", mod_obj$k, "\n")
+  })
+  
+  output$modelCompTable <- renderTable({
+    req(input$compareModels)
+    comp <- modelComparison()
+    if (is.null(comp)) {
+      data.frame(Message = "Model comparison failed or only one level in random effect.")
+    } else {
+      comp
+    }
+  })
+  
+  output$detailedReport <- renderPrint({
+    req(modelResult())
+    mod_obj <- modelResult()
+    cat("=== Detailed Report ===\n")
+    cat("\n--- Model Summary ---\n")
+    print(summary(mod_obj))
+    cat("\n--- Diagnostic Statistics ---\n")
+    if (!is.null(mod_obj$QE)) {
+      cat("Test for heterogeneity (Q-test):\n")
+      cat("  Q =", round(mod_obj$QE, 2), "\n")
+      df_val <- mod_obj$k - mod_obj$p
+      cat("  Degrees of freedom =", df_val, "\n")
+      cat("  p-value =", mod_obj$QEp, "\n")
+    }
+    cat("\nHeterogeneity Variance Components:\n")
+    print(mod_obj$sigma2)
+    cat("\nNumber of studies:", mod_obj$k, "\n")
+  })
+  
+  output$modSummary <- renderPrint({
+    req(input$includeMod)
+    modModel <- moderatorResult()
+    if (!is.null(modModel)) {
+      cat("=== Moderator Analysis Summary ===\n")
+      print(summary(modModel))
+    } else {
+      cat("Moderator analysis not run (factorVar not found or not selected).")
+    }
+  })
+  
+  # Download Handlers for Text/HTML Reports and Plots
+  output$downloadSummary <- downloadHandler(
+    filename = function() { paste("meta_analysis_summary_", Sys.Date(), ".txt", sep = "") },
+    content = function(file) {
+      summary_text <- capture.output({
+        print(summary(modelResult()))
+        cat("\n=== Diagnostic Statistics ===\n")
+        mod_obj <- modelResult()
+        if (!is.null(mod_obj$QE)) {
+          cat("Test for heterogeneity (Q-test):\n")
+          cat("  Q =", round(mod_obj$QE, 2), "\n")
+          df_val <- mod_obj$k - mod_obj$p
+          cat("  Degrees of freedom =", df_val, "\n")
+          cat("  p-value =", mod_obj$QEp, "\n")
+        }
+        cat("\nHeterogeneity Variance Components:\n")
+        print(mod_obj$sigma2)
+        cat("\nNumber of studies:", mod_obj$k, "\n")
+      })
+      writeLines(summary_text, con = file)
+    }
+  )
+  
+  output$downloadReport <- downloadHandler(
+    filename = function() { paste("meta_analysis_report_", Sys.Date(), ".html", sep = "") },
+    content = function(file) {
+      tempReport <- file.path(tempdir(), "report.Rmd")
+      reportText <- paste(
+        "---",
+        'title: "Meta-Analysis Report"',
+        "output: html_document",
+        "params:",
+        "  modelSummary: NA",
+        "  diagnostics: NA",
+        "  modelComp: NA",
+        "---",
+        "",
+        "```{r setup, include=FALSE}",
+        "knitr::opts_chunk$set(echo = FALSE)",
+        "```",
+        "",
+        "## Model Summary",
+        "",
+        "```{r}",
+        "cat(params$modelSummary, sep = \"\\n\")",
+        "```",
+        "",
+        "## Diagnostic Statistics",
+        "",
+        "```{r}",
+        "cat(params$diagnostics, sep = \"\\n\")",
+        "```",
+        "",
+        "## Model Comparison",
+        "",
+        "```{r}",
+        "if(!is.null(params$modelComp)) {",
+        "  cat(params$modelComp, sep = \"\\n\")",
+        "} else {",
+        "  cat(\"Model comparison was not run or failed.\")",
+        "}",
+        "```",
+        sep = "\n")
+      writeLines(reportText, tempReport)
+      
+      params <- list(
+        modelSummary = capture.output(print(summary(modelResult()))),
+        diagnostics = capture.output({
+          mod_obj <- modelResult()
+          if (!is.null(mod_obj$QE)) {
+            cat("Q-test: Q =", round(mod_obj$QE, 2),
+                ", df =", mod_obj$k - mod_obj$p,
+                ", p-value =", mod_obj$QEp, "\n")
+          }
+          cat("Heterogeneity Variance Components:\n")
+          print(mod_obj$sigma2)
+          cat("Number of studies:", mod_obj$k, "\n")
+        }),
+        modelComp = if (input$compareModels) capture.output(print(modelComparison())) else NULL
+      )
+      
+      rmarkdown::render(
+        input       = tempReport,
+        output_file = file,
+        params      = params,
+        envir       = new.env(parent = globalenv())
+      )
+    }
+  )
+  
+  output$downloadForestPlot <- downloadHandler(
+    filename = function() { paste("forest_plot_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      forest(modelResult(), main = input$forestTitle, col = getPlotColor())
+      dev.off()
+    }
+  )
+  
+  output$downloadFunnelPlot <- downloadHandler(
+    filename = function() { paste("funnel_plot_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      funnel(modelResult(), main = input$funnelTitle, col = getPlotColor())
+      dev.off()
+    }
+  )
+  
+  output$downloadLooPlot <- downloadHandler(
+    filename = function() { paste("leave_one_out_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      dat <- looEstimates()
+      dat <- dat[!is.na(dat$estimate), ]
+      plot(dat$estimate, type = "b", pch = 19,
+           xlab = "Leave-One-Out (Study Index)",
+           ylab = "Pooled Estimate (z)",
+           main = input$looTitle,
+           col = getPlotColor(), lwd = 2)
+      abline(h = coef(modelResult()), col = "gray", lty = 2)
+      text(seq_along(dat$estimate), dat$estimate,
+           labels = dat$author, pos = 3, cex = 0.8, col = getPlotColor())
+      dev.off()
+    }
+  )
+  
+  output$downloadCumulPlot <- downloadHandler(
+    filename = function() { paste("cumulative_plot_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      dat <- cumulEstimates()
+      plot(dat$cumIndex, dat$estimate, type = "b", pch = 19,
+           xlab = "Number of Studies Included",
+           ylab = "Pooled Estimate (z)",
+           main = input$cumulTitle,
+           col = getPlotColor(), lwd = 2, ylim = range(dat$estimate, na.rm = TRUE))
+      arrows(dat$cumIndex, dat$estimate - 1.96 * dat$se,
+             dat$cumIndex, dat$estimate + 1.96 * dat$se,
+             angle = 90, code = 3, length = 0.05, col = getPlotColor())
+      dev.off()
+    }
+  )
+  
+  output$downloadQQPlot <- downloadHandler(
+    filename = function() { paste("qq_plot_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      qqnorm(resid(modelResult()), main = input$qqTitle, col = getPlotColor())
+      qqline(resid(modelResult()), col = getPlotColor())
+      dev.off()
+    }
+  )
+  
+  output$downloadHistPlot <- downloadHandler(
+    filename = function() { paste("histogram_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      hist(dataset()$z, col = getPlotColor(),
+           main = input$histTitle, xlab = "Effect Size (z)")
+      dev.off()
+    }
+  )
+  
+  output$downloadBoxPlot <- downloadHandler(
+    filename = function() { paste("box_plot_", Sys.Date(), ".png", sep = "") },
+    content = function(file) {
+      png(file)
+      df <- dataset()
+      if ("factorVar" %in% colnames(df)) {
+        boxplot(z ~ factorVar, data = df, col = getPlotColor(),
+                main = input$boxTitle, xlab = "Factor Levels", ylab = "Effect Size (z)")
+      } else {
+        plot(1, 1, type = "n", axes = FALSE, xlab = "", ylab = "",
+             main = "factorVar not found in dataset.<br>Cannot draw Box Plot.")
+      }
+      dev.off()
+    }
+  )
+}
+
+# Run the app
+shinyApp(ui, server)
