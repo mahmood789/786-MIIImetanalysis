@@ -1,0 +1,477 @@
+# Load required libraries
+library(shiny)
+library(bs4Dash)
+library(DT)
+library(readr)
+library(readxl)
+library(dplyr)
+library(httr)
+library(jsonlite)
+library(netmeta)
+
+#------------------------------------------------------------------
+# Helper Functions
+#------------------------------------------------------------------
+
+# Function to call the Gemini API (using your provided API key)
+generate_content <- function(prompt, api_key) {
+  print(paste0("Calling Gemini API with prompt: ", substr(prompt, 1, 100), "..."))
+  
+  url <- paste0("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=", api_key)
+  body <- list(contents = list(list(parts = list(list(text = prompt)))))
+  res <- POST(url, 
+              body = toJSON(body, auto_unbox = TRUE),
+              encode = "json",
+              add_headers(`Content-Type` = "application/json"))
+  
+  status <- status_code(res)
+  rawContent <- content(res, as = "text", encoding = "UTF-8")
+  parsed <- fromJSON(rawContent, simplifyVector = FALSE)
+  
+  generated <- ""
+  if (!is.null(parsed$candidates) && length(parsed$candidates) > 0) {
+    candidate <- parsed$candidates[[1]]
+    if (!is.null(candidate$content) &&
+        !is.null(candidate$content$parts) &&
+        length(candidate$content$parts) > 0 &&
+        !is.null(candidate$content$parts[[1]]$text)) {
+      generated <- candidate$content$parts[[1]]$text
+    }
+  }
+  list(status = status, raw = rawContent, generated = generated)
+}
+
+# Function to clean markdown formatting (removes asterisks)
+clean_markdown <- function(text) {
+  text <- gsub("\\*\\*", "", text)
+  text <- gsub("\\*", "", text)
+  text
+}
+
+#------------------------------------------------------------------
+# UI
+#------------------------------------------------------------------
+
+ui <- bs4DashPage(
+  title = "NMA & LLM Interpretation App",
+  header = bs4DashNavbar(
+    title = bs4DashBrand(title = "NMA & LLM", color = "primary"),
+    skin = "light"
+  ),
+  sidebar = bs4DashSidebar(
+    skin = "light",
+    status = "primary",
+    title = "Navigation",
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Network Meta-Analysis", tabName = "nma", icon = icon("chart-line")),
+      bs4SidebarMenuItem("Data Table", tabName = "data", icon = icon("table"))
+    )
+  ),
+  body = bs4DashBody(
+    tabItems(
+      # NMA Tab
+      tabItem(
+        tabName = "nma",
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("upload"), "Upload NMA Data"),
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            fileInput("nmaData", "Choose CSV/Excel File", accept = c(".csv", ".xlsx"))
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("download"), "Download Sample CSV"),
+            status = "warning",
+            solidHeader = TRUE,
+            width = 12,
+            selectInput("sampleMeasure", "Select Summary Measure for Sample CSV", 
+                        choices = c("Risk Ratio (RR)" = "RR", 
+                                    "Odds Ratio (OR)" = "OR", 
+                                    "Risk Difference (RD)" = "RD",
+                                    "Mean Difference (MD)" = "MD",
+                                    "Standardized Mean Difference (SMD)" = "SMD"),
+                        selected = "RR"),
+            downloadButton("downloadSample", "Download Sample CSV", icon = icon("download"))
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("sliders-h"), "Analysis Options"),
+            status = "info",
+            solidHeader = TRUE,
+            width = 6,
+            radioButtons("summaryMeasure", "Summary Measure",
+                         choices = c("Risk Ratio (RR)" = "RR",
+                                     "Odds Ratio (OR)" = "OR",
+                                     "Risk Difference (RD)" = "RD",
+                                     "Mean Difference (MD)" = "MD",
+                                     "Standardized Mean Difference (SMD)" = "SMD"),
+                         selected = "RR"),
+            radioButtons("modelType", "Analysis Model",
+                         choices = c("Fixed Effects" = "fixed",
+                                     "Random Effects" = "random",
+                                     "Both" = "both"),
+                         selected = "fixed")
+          ),
+          bs4Card(
+            title = tagList(icon("play-circle"), "Run Network Meta-Analysis"),
+            status = "success",
+            solidHeader = TRUE,
+            width = 6,
+            actionButton("runNMA", "Run NMA", icon = icon("cogs"))
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("file-alt"), "NMA Summary"),
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            verbatimTextOutput("nmaSummary")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("magic"), "Generate LLM Interpretation"),
+            status = "success",
+            solidHeader = TRUE,
+            width = 12,
+            actionButton("generateLLM", "Generate Interpretation", icon = icon("magic")),
+            br(), br(),
+            htmlOutput("generatedLLM")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("bug"), "Debug Output"),
+            status = "danger",
+            solidHeader = TRUE,
+            collapsible = TRUE,
+            width = 12,
+            verbatimTextOutput("debugOutput")
+          )
+        )
+      ),
+      # Data Table Tab for reference or extra info
+      tabItem(
+        tabName = "data",
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("table"), "Sample Data"),
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            DTOutput("dataTable")
+          )
+        )
+      )
+    )
+  ),
+  footer = bs4DashFooter(left = "© 2025 NMA & LLM App")
+)
+
+#------------------------------------------------------------------
+# Server
+#------------------------------------------------------------------
+
+server <- function(input, output, session) {
+  
+  # Hard-coded API key from your provided code
+  api_key <- "AIzaSyDLyY_CBROavHzTXRgTN_4WVCuy4rexsE8"
+  
+  # Reactive values for storing the NMA summary, LLM interpretation, and debug messages
+  nmaSummaryText <- reactiveVal("")
+  llmOutput <- reactiveVal("")
+  debugInfo <- reactiveVal("")
+  
+  # Function to append debugging messages
+  appendDebug <- function(msg) {
+    new_debug <- paste(debugInfo(), msg, sep = "\n")
+    debugInfo(new_debug)
+    message("[DEBUG] ", msg)
+  }
+  
+  # Dummy sample data for Data Table tab (for demonstration purposes)
+  sampleData <- data.frame(
+    Study = paste("Study", 1:10),
+    RiskRatio = round(runif(10, 0.5, 1), 2),
+    LowerCI = round(runif(10, 0.3, 0.7), 2),
+    UpperCI = round(runif(10, 1, 1.5), 2),
+    stringsAsFactors = FALSE
+  )
+  output$dataTable <- renderDT({
+    datatable(sampleData, options = list(pageLength = 10))
+  })
+  
+  # Download handler for sample CSV files with extra columns:
+  # "study", "effect_estimate", "std_error", "treatment1", "treatment2", "covariate", "study_design"
+  output$downloadSample <- downloadHandler(
+    filename = function() {
+      paste0("sample_nma_", input$sampleMeasure, ".csv")
+    },
+    content = function(file) {
+      measure <- input$sampleMeasure
+      if(measure %in% c("RR", "OR")) {
+        sampleData <- data.frame(
+          study = paste("Study", 1:10),
+          effect_estimate = c(0.75, 0.65, 0.80, 0.70, 0.85, 0.78, 0.72, 0.68, 0.82, 0.74),
+          std_error = c(0.10, 0.12, 0.09, 0.08, 0.11, 0.10, 0.07, 0.09, 0.08, 0.10),
+          treatment1 = c("Drug A", "Drug B", "Drug C", "Drug A", "Drug A", "Drug B", "Drug A", "Drug B", "Drug C", "Drug D"),
+          treatment2 = c("Placebo", "Placebo", "Placebo", "Drug B", "Drug C", "Drug C", "Drug D", "Drug D", "Drug D", "Placebo"),
+          covariate = c(1.0, 2.0, 3.0, 4.0, 5.0, 2.5, 3.5, 1.5, 4.5, 2.2),
+          study_design = c("RCT", "RCT", "RCT", "Observational", "RCT", "Observational", "RCT", "RCT", "Observational", "RCT")
+        )
+      } else if(measure == "RD") {
+        sampleData <- data.frame(
+          study = paste("Study", 1:10),
+          effect_estimate = c(0.05, -0.03, 0.08, 0.02, -0.04, 0.07, 0.01, -0.02, 0.06, 0.00),
+          std_error = c(0.02, 0.03, 0.02, 0.02, 0.03, 0.02, 0.02, 0.03, 0.02, 0.02),
+          treatment1 = c("Treatment A", "Treatment B", "Treatment C", "Treatment A", "Treatment A", "Treatment B", "Treatment A", "Treatment B", "Treatment C", "Treatment D"),
+          treatment2 = c("Control", "Control", "Control", "Treatment B", "Treatment C", "Treatment C", "Treatment D", "Treatment D", "Treatment D", "Control"),
+          covariate = c(0.8, 1.6, 2.4, 3.2, 4.0, 4.8, 5.6, 6.4, 7.2, 8.0),
+          study_design = c("RCT", "Observational", "RCT", "RCT", "Observational", "RCT", "RCT", "RCT", "Observational", "RCT")
+        )
+      } else if(measure == "MD") {
+        sampleData <- data.frame(
+          study = paste("Study", 1:10),
+          effect_estimate = c(1.2, -0.5, 0.8, 0.3, -1.0, 0.6, 1.5, -0.8, 0.9, 0.0),
+          std_error = c(0.3, 0.4, 0.2, 0.3, 0.4, 0.3, 0.2, 0.4, 0.3, 0.3),
+          treatment1 = c("Drug X", "Drug Y", "Drug Z", "Drug X", "Drug X", "Drug Y", "Drug X", "Drug Y", "Drug Z", "Drug W"),
+          treatment2 = c("Placebo", "Placebo", "Placebo", "Drug Y", "Drug Z", "Drug Z", "Drug W", "Drug W", "Drug W", "Placebo"),
+          covariate = c(2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0),
+          study_design = c("RCT", "RCT", "Observational", "RCT", "RCT", "Observational", "RCT", "RCT", "Observational", "RCT")
+        )
+      } else if(measure == "SMD") {
+        sampleData <- data.frame(
+          study = paste("Study", 1:10),
+          effect_estimate = c(0.2, -0.3, 0.5, 0.1, -0.4, 0.3, 0.0, -0.1, 0.4, 0.2),
+          std_error = c(0.15, 0.20, 0.10, 0.15, 0.20, 0.15, 0.10, 0.20, 0.15, 0.15),
+          treatment1 = c("Therapy A", "Therapy B", "Therapy C", "Therapy A", "Therapy A", "Therapy B", "Therapy A", "Therapy B", "Therapy C", "Therapy D"),
+          treatment2 = c("Control", "Control", "Control", "Therapy B", "Therapy C", "Therapy C", "Therapy D", "Therapy D", "Therapy D", "Control"),
+          covariate = c(0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0),
+          study_design = c("RCT", "Observational", "RCT", "RCT", "Observational", "RCT", "RCT", "RCT", "Observational", "RCT")
+        )
+      }
+      write.csv(sampleData, file, row.names = FALSE)
+    }
+  )
+  
+  # Run the NMA when the Run NMA button is clicked
+  observeEvent(input$runNMA, {
+    appendDebug("Run NMA button clicked.")
+    req(input$nmaData)
+    
+    # Read data based on file extension
+    ext <- tools::file_ext(input$nmaData$name)
+    appendDebug(paste("Uploaded file extension:", ext))
+    
+    if (ext == "csv") {
+      nma_data <- tryCatch({
+        read_csv(input$nmaData$datapath)
+      }, error = function(e) {
+        appendDebug(paste("Error reading CSV:", e$message))
+        NULL
+      })
+    } else if (ext %in% c("xls", "xlsx")) {
+      nma_data <- tryCatch({
+        read_excel(input$nmaData$datapath)
+      }, error = function(e) {
+        appendDebug(paste("Error reading Excel:", e$message))
+        NULL
+      })
+    } else {
+      nma_data <- NULL
+    }
+    
+    if (is.null(nma_data)) {
+      nmaSummaryText("Unable to read the uploaded data. Please check the file format.")
+      appendDebug("Data upload failed.")
+      return()
+    } else {
+      appendDebug("Data successfully uploaded.")
+    }
+    
+    # Convert study labels to character (if available)
+    if("study" %in% names(nma_data)){
+      nma_data$study <- as.character(nma_data$study)
+    }
+    
+    # Ensure the covariate column is numeric if it exists
+    if("covariate" %in% names(nma_data)){
+      nma_data$covariate <- as.numeric(nma_data$covariate)
+    }
+    
+    # Determine the summary measure and model type from input
+    sm <- input$summaryMeasure
+    modelType <- input$modelType
+    
+    # Helper function to run netmeta analysis and return an advanced text summary
+    runAnalysis <- function(model, sm) {
+      res <- tryCatch({
+        if(model == "fixed") {
+          netmeta(
+            TE = nma_data$effect_estimate,
+            seTE = nma_data$std_error,
+            studlab = nma_data$study,  # Include study labels for meta-regression
+            treat1 = nma_data$treatment1,
+            treat2 = nma_data$treatment2,
+            data = nma_data,
+            sm = sm
+          )
+        } else if(model == "random") {
+          netmeta(
+            TE = nma_data$effect_estimate,
+            seTE = nma_data$std_error,
+            studlab = nma_data$study,  # Include study labels for meta-regression
+            treat1 = nma_data$treatment1,
+            treat2 = nma_data$treatment2,
+            data = nma_data,
+            sm = sm,
+            comb.random = "DL"  # DerSimonian-Laird random effects
+          )
+        }
+      }, error = function(e) {
+        appendDebug(paste("Error in", model, "analysis:", e$message))
+        NULL
+      })
+      
+      if (!is.null(res)) {
+        # Basic summary
+        basic_summary <- paste(capture.output(summary(res)), collapse = "\n")
+        
+        # Heterogeneity statistics
+        heterogeneity <- paste0("Heterogeneity statistics:\n",
+                                "  Q = ", round(res$Q, 2),
+                                " (df = ", res$df.Q, ", p = ", format.pval(res$pval.Q), ")\n",
+                                "  I² = ", round(res$I2, 2),
+                                "  tau² = ", round(res$tau2, 2))
+        
+        # Prediction interval for continuous outcomes in random-effects model
+        if(model == "random" && sm %in% c("MD", "SMD")) {
+          overall_est <- res$TE.random
+          overall_se <- res$seTE.random
+          pred_lower <- overall_est - 1.96 * sqrt(overall_se^2 + res$tau2)
+          pred_upper <- overall_est + 1.96 * sqrt(overall_se^2 + res$tau2)
+          prediction_interval <- paste("95% Prediction Interval: [", round(pred_lower,2), ",", round(pred_upper,2), "]")
+        } else {
+          prediction_interval <- "Prediction interval not applicable."
+        }
+        
+        # Treatment ranking using netrank (if available)
+        ranking <- tryCatch({
+          rank <- netrank(res)
+          paste(capture.output(rank), collapse = "\n")
+        }, error = function(e) {
+          "Treatment ranking not available."
+        })
+        
+        # Decomposition of heterogeneity by study design using decomp.design
+        design_decomp <- tryCatch({
+          decomp <- decomp.design(res)
+          paste(capture.output(decomp), collapse = "\n")
+        }, error = function(e) {
+          "Design decomposition not available."
+        })
+        
+        # Meta-regression if a 'covariate' column is available and has variation.
+        # Instead of a formula, we now pass the covariate vector directly.
+        meta_reg <- if("covariate" %in% names(nma_data)){
+          if(length(unique(nma_data$covariate)) > 1){
+            tryCatch({
+              reg <- getFromNamespace("netmetareg", "netmeta")(res, covariate = nma_data$covariate)
+              paste(capture.output(summary(reg)), collapse = "\n")
+            }, error = function(e) {
+              paste("Meta-regression failed: check your covariate data. Error:", e$message)
+            })
+          } else {
+            "Meta-regression not possible: covariate has no variation."
+          }
+        } else {
+          "No covariate available for meta-regression."
+        }
+        
+        # Inconsistency analysis using netsplit (if applicable)
+        inconsistency <- tryCatch({
+          ns <- netsplit(res)
+          paste(capture.output(ns), collapse = "\n")
+        }, error = function(e) {
+          "Inconsistency analysis not available."
+        })
+        
+        # Count unique studies if "study" column exists
+        study_info <- if("study" %in% names(nma_data)){
+          paste("Number of studies:", length(unique(nma_data$study)))
+        } else {
+          "Study count not available."
+        }
+        
+        # Combine all details into a final summary text
+        final_text <- paste("-----", toupper(model), "EFFECTS -----\n",
+                            "Basic Summary:\n", basic_summary,
+                            "\n\n", study_info,
+                            "\n\nHeterogeneity:\n", heterogeneity,
+                            "\n\nPrediction Interval:\n", prediction_interval,
+                            "\n\nTreatment Ranking:\n", ranking,
+                            "\n\nDesign Decomposition:\n", design_decomp,
+                            "\n\nMeta-Regression:\n", meta_reg,
+                            "\n\nInconsistency Analysis:\n", inconsistency)
+        final_text
+      } else {
+        paste("Error in", model, "analysis.")
+      }
+    }
+    
+    # Run the analysis based on the selected model type
+    if(modelType == "both") {
+      fixedSummary <- runAnalysis("fixed", sm)
+      randomSummary <- runAnalysis("random", sm)
+      final_summary <- paste(fixedSummary, "\n\n", randomSummary)
+      nmaSummaryText(final_summary)
+      appendDebug("Both fixed and random effects analyses completed.")
+    } else {
+      analysisSummary <- runAnalysis(modelType, sm)
+      nmaSummaryText(analysisSummary)
+      appendDebug(paste(toupper(modelType), "effects analysis completed."))
+    }
+  })
+  
+  output$nmaSummary <- renderText({
+    nmaSummaryText()
+  })
+  
+  # When the Generate Interpretation button is clicked, call the Gemini API
+  observeEvent(input$generateLLM, {
+    appendDebug("Generate LLM Interpretation button clicked.")
+    req(nmaSummaryText())
+    
+    prompt <- paste("Based on the following network meta-analysis results, provide a detailed interpretation with clinical insights:\n\n", nmaSummaryText())
+    appendDebug(paste("Constructed prompt (first 100 chars):", substr(prompt, 1, 100)))
+    
+    res <- generate_content(prompt, api_key)
+    appendDebug(paste("Gemini API status code:", res$status))
+    appendDebug("Gemini API raw response:")
+    appendDebug(res$raw)
+    
+    if (!is.null(res$generated) && res$generated != "") {
+      llmOutput(clean_markdown(res$generated))
+      appendDebug("LLM interpretation received and processed.")
+    } else {
+      llmOutput("No generated content received. Please check the API response.")
+      appendDebug("LLM interpretation was empty.")
+    }
+  })
+  
+  output$generatedLLM <- renderUI({
+    tags$div(style = "text-align: justify; white-space: pre-wrap;", llmOutput())
+  })
+  
+  output$debugOutput <- renderText({
+    debugInfo()
+  })
+}
+
+# Run the Shiny app
+shinyApp(ui, server)
