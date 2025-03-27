@@ -1,0 +1,872 @@
+library(bs4Dash)
+library(shiny)
+library(survival)
+library(survminer)
+library(meta)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+
+ui <- bs4DashPage(
+  title = "786MIII: KM, Meta & Cox PH Analysis App",
+  header = bs4DashNavbar(
+    skin = "light",
+    title = "786MIII: KM, Meta & Cox PH Analysis App"
+  ),
+  sidebar = bs4DashSidebar(
+    skin = "light",
+    status = "primary",
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Data & Options", tabName = "data", icon = icon("database")),
+      bs4SidebarMenuItem("KM & Alternative Plots", tabName = "km", icon = icon("chart-line")),
+      bs4SidebarMenuItem("Meta-analysis", tabName = "meta", icon = icon("table")),
+      bs4SidebarMenuItem("Cox PH & Diagnostics", tabName = "cox", icon = icon("heartbeat")),
+      bs4SidebarMenuItem("Data Exploration", tabName = "explore", icon = icon("search")),
+      bs4SidebarMenuItem("Detailed Summaries", tabName = "detailed", icon = icon("file-alt"))
+    )
+  ),
+  body = bs4DashBody(
+    tabItems(
+      # Data & Options Tab
+      tabItem(
+        tabName = "data",
+        fluidRow(
+          box(
+            title = "Data Input & Options", status = "primary", solidHeader = TRUE, width = 12,
+            radioButtons("dataSource", "Choose Data Source:",
+                         choices = c("Sample Data", "Upload CSV"),
+                         selected = "Sample Data", inline = TRUE),
+            conditionalPanel(
+              condition = "input.dataSource == 'Upload CSV'",
+              fileInput("datafile", "Upload CSV with Survival Data", accept = ".csv")
+            ),
+            conditionalPanel(
+              condition = "input.dataSource == 'Sample Data'",
+              helpText("Using built-in sample data."),
+              downloadButton("downloadSampleData", "Download Sample CSV")
+            )
+          )
+        ),
+        fluidRow(
+          box(
+            title = "KM Plot Options", status = "info", solidHeader = TRUE, width = 12,
+            checkboxInput("showRiskTable", "Show Risk Table", value = TRUE),
+            checkboxInput("showConfInt", "Show Confidence Intervals", value = TRUE),
+            checkboxInput("showPval", "Show Log-Rank P-Value", value = TRUE)
+          )
+        ),
+        fluidRow(
+          box(
+            title = "Meta-analysis Options", status = "info", solidHeader = TRUE, width = 12,
+            # Overall meta options
+            selectInput("metaModel", "Meta-Analysis Model",
+                        choices = c("Random Effects" = "random", "Fixed Effects" = "fixed"),
+                        selected = "random", width = "100%"),
+            checkboxInput("backtransf", "Back-transform Forest & Funnel Plot", value = TRUE)
+          )
+        ),
+        fluidRow(
+          box(
+            title = "Advanced Cox PH Options", status = "info", solidHeader = TRUE, width = 12,
+            checkboxInput("runCoxPH", "Run Cox PH (study as covariate)", value = FALSE),
+            checkboxInput("testPH", "Test proportional hazards", value = FALSE),
+            checkboxInput("showSchoenfeld", "Show Schoenfeld Residual Plot", value = TRUE),
+            checkboxInput("showBaselineHazard", "Show Baseline Hazard Plot", value = TRUE),
+            checkboxInput("showMartingale", "Show Martingale Residual Plot", value = FALSE)
+          )
+        ),
+        fluidRow(
+          box(
+            title = "Run Analysis", status = "success", solidHeader = TRUE, width = 12,
+            actionButton("analyze", "Run Analysis", icon = icon("play"), class = "btn-primary")
+          )
+        ),
+        fluidRow(
+          box(
+            title = "WebPlotDigitizer",
+            status = "info", solidHeader = TRUE, width = 12,
+            "WebPlotDigitizer is a free online tool for extracting numerical data from graphical curves, including Kaplan–Meier curves. ",
+            "You can use it by visiting ",
+            a("WebPlotDigitizer", href = "https://apps.automeris.io/wpd/", target = "_blank"),
+            "."
+          )
+        )
+      ),
+      
+      # KM & Alternative Plots Tab
+      tabItem(
+        tabName = "km",
+        fluidRow(
+          box(
+            title = "Kaplan-Meier & Alternative Plots", status = "primary", solidHeader = TRUE, width = 12,
+            tabsetPanel(
+              tabPanel("Individual KM",
+                       plotOutput("kmplot_individual", height = "400px"),
+                       downloadButton("downloadKMIndividual", "Download Individual KM Plot")),
+              tabPanel("Pooled KM",
+                       plotOutput("kmplot_pooled", height = "400px"),
+                       downloadButton("downloadKMPooled", "Download Pooled KM Plot")),
+              tabPanel("Cumulative Hazard",
+                       plotOutput("cumhazPlot", height = "400px"),
+                       downloadButton("downloadCumhaz", "Download Cumulative Hazard Plot")),
+              tabPanel("Log-Log Survival",
+                       plotOutput("loglogPlot", height = "400px"),
+                       downloadButton("downloadLoglog", "Download Log-Log Plot"))
+            )
+          )
+        )
+      ),
+      
+      # Meta-analysis Tab
+      tabItem(
+        tabName = "meta",
+        fluidRow(
+          box(
+            title = "Meta-analysis", status = "primary", solidHeader = TRUE, width = 12,
+            tabsetPanel(
+              tabPanel("Forest Plot",
+                       plotOutput("forestplot", height = "400px"),
+                       downloadButton("downloadForest", "Download Forest Plot"),
+                       br(), br(),
+                       box(
+                         title = "Forest Plot Customization Options", status = "info", solidHeader = TRUE, width = 12,
+                         conditionalPanel(
+                           condition = "input.backtransf == true",
+                           sliderInput("forestXRangeHR", "X-axis Range (HR scale)", min = 0.1, max = 10, value = c(0.8, 1.2), step = 0.1),
+                           textInput("forestXLabelHR", "X-axis Label", value = "Hazard Ratio"),
+                           textInput("forestTitleHR", "Plot Title", value = "Forest Plot of Hazard Ratios")
+                         ),
+                         conditionalPanel(
+                           condition = "input.backtransf == false",
+                           sliderInput("forestXRange", "X-axis Range (log scale)", min = -5, max = 5, value = c(-1, 1), step = 0.1),
+                           textInput("forestXLabel", "X-axis Label", value = "Log Hazard Ratio"),
+                           textInput("forestTitle", "Plot Title", value = "Forest Plot of Log Hazard Ratios")
+                         ),
+                         selectInput("forestStudyColor", "Study Label Color", 
+                                     choices = c("black", "blue", "red", "green", "purple"), selected = "black"),
+                         selectInput("forestSquareColor", "Square Color", 
+                                     choices = c("black", "blue", "red", "green", "purple"), selected = "blue"),
+                         selectInput("forestDiamondColor", "Diamond Color", 
+                                     choices = c("black", "blue", "red", "green", "purple"), selected = "red"),
+                         selectInput("forestDiamondLineColor", "Diamond Line Color", 
+                                     choices = c("black", "blue", "red", "green", "purple"), selected = "black"),
+                         sliderInput("forestTextSize", "Text Size", min = 0.5, max = 2, value = 1, step = 0.1),
+                         selectInput("forestFont", "Font", choices = c("sans", "serif", "mono"), selected = "sans"),
+                         sliderInput("forestLwd", "Line Width", min = 0.5, max = 5, value = 1, step = 0.5),
+                         selectInput("forestPlotStyle", "Forest Plot Style", choices = c("Classic", "Modern"), selected = "Classic")
+                       )
+              ),
+              tabPanel("Funnel Plot",
+                       plotOutput("funnelplot", height = "400px"),
+                       downloadButton("downloadFunnel", "Download Funnel Plot"),
+                       br(), br(),
+                       box(
+                         title = "Funnel Plot Customization Options", status = "info", solidHeader = TRUE, width = 12,
+                         conditionalPanel(
+                           condition = "input.backtransf == true",
+                           sliderInput("funnelXRangeHR", "X-axis Range (HR scale)", min = 0.1, max = 10, value = c(0.8, 1.2), step = 0.1),
+                           textInput("funnelXLabelHR", "X-axis Label", value = "Hazard Ratio"),
+                           textInput("funnelTitleHR", "Plot Title", value = "Funnel Plot for Publication Bias")
+                         ),
+                         conditionalPanel(
+                           condition = "input.backtransf == false",
+                           sliderInput("funnelXRange", "X-axis Range (log scale)", min = -5, max = 5, value = c(-1, 1), step = 0.1),
+                           textInput("funnelXLabel", "X-axis Label", value = "Log Hazard Ratio"),
+                           textInput("funnelTitle", "Plot Title", value = "Funnel Plot for Publication Bias")
+                         ),
+                         selectInput("funnelColor", "Funnel Plot Point Color", 
+                                     choices = c("black", "blue", "red", "green", "purple"), selected = "black"),
+                         sliderInput("funnelTextSize", "Text Size", min = 0.5, max = 2, value = 1, step = 0.1),
+                         selectInput("funnelFont", "Font", choices = c("sans", "serif", "mono"), selected = "sans"),
+                         sliderInput("funnelLwd", "Line Width", min = 0.5, max = 5, value = 1, step = 0.5),
+                         selectInput("funnelPch", "Point Symbol", 
+                                     choices = c("Circle" = 16, "Square" = 15, "Triangle" = 17, "Diamond" = 18), selected = 16)
+                       )
+              ),
+              tabPanel("Summary",
+                       verbatimTextOutput("metaSummary"),
+                       verbatimTextOutput("biasTest")
+              )
+            )
+          )
+        )
+      ),
+      
+      # Cox PH & Diagnostics Tab
+      tabItem(
+        tabName = "cox",
+        fluidRow(
+          box(
+            title = "Cox PH Analysis & Diagnostics", status = "primary", solidHeader = TRUE, width = 12,
+            tabsetPanel(
+              tabPanel("Cox Model",
+                       verbatimTextOutput("coxSummary")),
+              tabPanel("PH Test",
+                       verbatimTextOutput("phTest")),
+              tabPanel("Diagnostics",
+                       verbatimTextOutput("coxDetails"),
+                       br(),
+                       conditionalPanel(
+                         condition = "input.showSchoenfeld == true",
+                         plotOutput("schoenfeldPlot", height = "400px")
+                       ),
+                       br(),
+                       conditionalPanel(
+                         condition = "input.showBaselineHazard == true",
+                         plotOutput("baselineHazardPlot", height = "400px")
+                       ),
+                       br(),
+                       conditionalPanel(
+                         condition = "input.showMartingale == true",
+                         plotOutput("martingalePlot", height = "400px")
+                       ))
+            )
+          )
+        )
+      ),
+      
+      # Data Exploration Tab
+      tabItem(
+        tabName = "explore",
+        fluidRow(
+          box(
+            title = "Data Exploration", status = "primary", solidHeader = TRUE, width = 12,
+            tabsetPanel(
+              tabPanel("Histogram",
+                       checkboxInput("showDensity", "Overlay Density Curve", value = FALSE),
+                       plotOutput("timeHistogram", height = "400px")),
+              tabPanel("Boxplot",
+                       plotOutput("boxplotByStudy", height = "400px"))
+            )
+          )
+        )
+      ),
+      
+      # Detailed Summaries Tab
+      tabItem(
+        tabName = "detailed",
+        fluidRow(
+          box(
+            title = "Detailed Summaries", status = "primary", solidHeader = TRUE, width = 12,
+            tabsetPanel(
+              tabPanel("KM Fit - Individual",
+                       verbatimTextOutput("kmFitIndividualSummary")),
+              tabPanel("KM Fit - Pooled",
+                       verbatimTextOutput("kmFitPooledSummary")),
+              tabPanel("Meta Analysis Object",
+                       verbatimTextOutput("metaObjectPrint")),
+              tabPanel("Cox Baseline Hazard",
+                       verbatimTextOutput("coxBaselineHazardPrint"))
+            )
+          )
+        )
+      )
+    )
+  ),
+  controlbar = bs4DashControlbar(),
+  footer = bs4DashFooter()
+)
+
+server <- function(input, output, session) {
+  
+  # Sample data generator
+  getSampleData <- function() {
+    set.seed(123)
+    data.frame(
+      study  = rep(c("Study A", "Study B", "Study C"), each = 50),
+      time   = abs(c(rnorm(50, mean = 5, sd = 2), 
+                     rnorm(50, mean = 6, sd = 2), 
+                     rnorm(50, mean = 4, sd = 2))),
+      status = rbinom(150, 1, prob = 0.7),
+      hr     = rep(c(1.2, 0.8, 1.0), each = 50),
+      hr_se  = rep(c(0.1, 0.12, 0.15), each = 50)
+    )
+  }
+  
+  output$downloadSampleData <- downloadHandler(
+    filename = function() { paste0("sample_data_", Sys.Date(), ".csv") },
+    content = function(file) {
+      write.csv(getSampleData(), file, row.names = FALSE)
+    }
+  )
+  
+  # Reactive data
+  data <- reactive({
+    if (input$dataSource == "Sample Data") {
+      getSampleData()
+    } else {
+      req(input$datafile)
+      read.csv(input$datafile$datapath)
+    }
+  })
+  
+  # Reactive values for fits and plots
+  survfits <- reactiveValues(
+    fit_individual = NULL,
+    fit_pooled     = NULL,
+    kmplot_ind     = NULL,
+    kmplot_pool    = NULL,
+    cumhaz_plot    = NULL,
+    loglog_plot    = NULL
+  )
+  meta_objects <- reactiveValues(meta_res = NULL)
+  cox_objects <- reactiveValues(cox_model = NULL, ph_test = NULL, bh = NULL)
+  
+  observeEvent(input$analyze, {
+    df <- data()
+    
+    # Data Preview
+    output$datapreview <- renderTable({
+      df[, setdiff(names(df), "SurvObj"), drop = FALSE]
+    })
+    
+    # Validate required columns
+    req_cols <- c("study", "time", "status")
+    if (!all(req_cols %in% names(df))) {
+      showNotification(
+        paste("The CSV must contain these columns:", paste(req_cols, collapse = ", ")),
+        type = "error"
+      )
+      return(NULL)
+    }
+    
+    # Create Surv object
+    df$SurvObj <- with(df, Surv(time, status))
+    
+    # Study Summaries
+    study_summaries <- df %>%
+      group_by(study) %>%
+      do({
+        tmp <- .
+        fit_tmp <- survfit(SurvObj ~ 1, data = tmp)
+        summ <- summary(fit_tmp)$table
+        if (is.matrix(summ)) {
+          med <- as.numeric(summ[,"median"])
+          lower <- as.numeric(summ[,"0.95LCL"])
+          upper <- as.numeric(summ[,"0.95UCL"])
+        } else {
+          med <- as.numeric(summ["median"])
+          lower <- as.numeric(summ["0.95LCL"])
+          upper <- as.numeric(summ["0.95UCL"])
+        }
+        tibble(
+          n = nrow(tmp),
+          events = sum(tmp$status == 1),
+          median_surv = med,
+          lower_ci = lower,
+          upper_ci = upper
+        )
+      }) %>%
+      ungroup()
+    
+    output$studySummary <- renderTable({ as.data.frame(study_summaries) })
+    
+    # Kaplan-Meier: Individual & Pooled
+    fit_individual <- tryCatch({
+      survfit(SurvObj ~ study, data = df)
+    }, error = function(e) NULL)
+    survfits$fit_individual <- fit_individual
+    
+    fit_pooled <- tryCatch({
+      survfit(SurvObj ~ 1, data = df)
+    }, error = function(e) NULL)
+    survfits$fit_pooled <- fit_pooled
+    
+    output$kmplot_individual <- renderPlot({
+      req(fit_individual)
+      p <- ggsurvplot(
+        fit_individual, data = df,
+        risk.table = input$showRiskTable,
+        pval = input$showPval,
+        conf.int = input$showConfInt,
+        legend = "right",
+        title = "Kaplan-Meier Curves by Study"
+      )
+      survfits$kmplot_ind <- p
+      print(p)
+    })
+    
+    output$kmplot_pooled <- renderPlot({
+      req(fit_pooled)
+      p <- ggsurvplot(
+        fit_pooled, data = df,
+        risk.table = input$showRiskTable,
+        pval = input$showPval,
+        conf.int = input$showConfInt,
+        legend = "none",
+        title = "Pooled Kaplan-Meier Curve"
+      )
+      survfits$kmplot_pool <- p
+      print(p)
+    })
+    
+    # Alternative Plots
+    output$cumhazPlot <- renderPlot({
+      req(fit_pooled)
+      p <- ggsurvplot(
+        fit_pooled, data = df,
+        fun = "cumhaz",
+        risk.table = FALSE,
+        conf.int = input$showConfInt,
+        title = "Pooled Cumulative Hazard"
+      )
+      survfits$cumhaz_plot <- p
+      print(p)
+    })
+    
+    output$loglogPlot <- renderPlot({
+      req(fit_pooled)
+      p <- tryCatch({
+        ggsurvplot(
+          fit_pooled, data = df,
+          fun = "cloglog",
+          risk.table = FALSE,
+          conf.int = input$showConfInt,
+          title = "Pooled log(-log) Survival"
+        )
+      }, error = function(e) NULL)
+      if (is.null(p)) {
+        plot.new()
+        text(0.5, 0.5, "Error generating log(-log) plot.", cex = 1.5)
+      } else {
+        survfits$loglog_plot <- p
+        print(p)
+      }
+    })
+    
+    # Meta-analysis
+    if (all(c("hr", "hr_se") %in% names(df))) {
+      meta_data <- df %>% group_by(study) %>% slice(1) %>% ungroup()
+      meta_res <- tryCatch({
+        metagen(
+          TE = log(meta_data$hr),
+          seTE = meta_data$hr_se,
+          studlab = meta_data$study,
+          sm = "HR",
+          common = (input$metaModel == "fixed"),
+          random = (input$metaModel == "random")
+        )
+      }, error = function(e) NULL)
+      meta_objects$meta_res <- meta_res
+      
+      output$forestplot <- renderPlot({
+        if (!is.null(meta_res)) {
+          if(input$forestPlotStyle == "Modern"){
+            extraArgs <- list(colgap.forest = "2cm", colgap.study = "1cm")
+          } else {
+            extraArgs <- list()
+          }
+          if (input$backtransf) {
+            do.call(forest, c(list(meta_res,
+                                   backtransf = TRUE,
+                                   leftlabs = meta_data$study,
+                                   xlim = input$forestXRangeHR,
+                                   xlab = input$forestXLabelHR,
+                                   main = input$forestTitleHR,
+                                   col.study = input$forestStudyColor,
+                                   col.square = input$forestSquareColor,
+                                   col.diamond = input$forestDiamondColor,
+                                   col.diamond.lines = input$forestDiamondLineColor,
+                                   cex = input$forestTextSize,
+                                   lwd = input$forestLwd),
+                              extraArgs))
+          } else {
+            do.call(forest, c(list(meta_res,
+                                   leftlabs = meta_data$study,
+                                   xlim = input$forestXRange,
+                                   xlab = input$forestXLabel,
+                                   main = input$forestTitle,
+                                   col.study = input$forestStudyColor,
+                                   col.square = input$forestSquareColor,
+                                   col.diamond = input$forestDiamondColor,
+                                   col.diamond.lines = input$forestDiamondLineColor,
+                                   cex = input$forestTextSize,
+                                   lwd = input$forestLwd),
+                              extraArgs))
+          }
+        } else {
+          plot.new()
+          text(0.5, 0.5, "Meta-analysis failed.", cex = 1.2)
+        }
+      })
+      
+      output$metaSummary <- renderText({
+        if (is.null(meta_res)) {
+          "Meta-analysis failed."
+        } else {
+          if (input$metaModel == "fixed") {
+            summary_text <- paste0(
+              "Fixed-effects model (Inverse-variance weighting, Mantel-Haenszel pooling):\n",
+              sprintf("Estimated HR = %.3f (95%% CI: %.3f - %.3f), p = %.4f\n",
+                      exp(meta_res$TE.fixed), exp(meta_res$lower.fixed), exp(meta_res$upper.fixed), meta_res$pval.fixed),
+              "Heterogeneity statistics:\n",
+              sprintf("Q = %.2f, df = %d, p = %.4f\n", meta_res$Q, meta_res$df.Q, meta_res$pval.Q),
+              sprintf("I² = %.2f%%, Tau² = %.4f", meta_res$I2, meta_res$tau2),
+              "\nPooling was performed using inverse-variance weighting."
+            )
+          } else {
+            summary_text <- paste0(
+              "Random-effects model (Inverse-variance weighting, DerSimonian-Laird method):\n",
+              sprintf("Estimated HR = %.3f (95%% CI: %.3f - %.3f), p = %.4f\n",
+                      exp(meta_res$TE.random), exp(meta_res$lower.random), exp(meta_res$upper.random), meta_res$pval.random),
+              "Heterogeneity statistics:\n",
+              sprintf("Q = %.2f, df = %d, p = %.4f\n", meta_res$Q, meta_res$df.Q, meta_res$pval.Q),
+              sprintf("I² = %.2f%%, Tau² = %.4f", meta_res$I2, meta_res$tau2),
+              "\nPooling was performed using inverse-variance weighting with DerSimonian-Laird estimation of between-study variance."
+            )
+          }
+          summary_text
+        }
+      })
+      
+      output$funnelplot <- renderPlot({
+        if (!is.null(meta_res)) {
+          if (input$backtransf) {
+            funnel(meta_res,
+                   backtransf = TRUE,
+                   xlim = input$funnelXRangeHR,
+                   xlab = input$funnelXLabelHR,
+                   main = input$funnelTitleHR,
+                   col = input$funnelColor,
+                   cex = input$funnelTextSize,
+                   lwd = input$funnelLwd,
+                   pch = as.numeric(input$funnelPch))
+          } else {
+            funnel(meta_res,
+                   xlim = input$funnelXRange,
+                   xlab = input$funnelXLabel,
+                   main = input$funnelTitle,
+                   col = input$funnelColor,
+                   cex = input$funnelTextSize,
+                   lwd = input$funnelLwd,
+                   pch = as.numeric(input$funnelPch))
+          }
+        } else {
+          plot.new()
+          text(0.5, 0.5, "Meta-analysis failed; no funnel plot.", cex = 1.2)
+        }
+      })
+      
+      output$biasTest <- renderText({
+        if (is.null(meta_res)) {
+          "No bias test possible; meta-analysis failed."
+        } else {
+          bias_res <- tryCatch({
+            metabias(meta_res, method = "linreg")
+          }, error = function(e) NULL)
+          if (is.null(bias_res)) {
+            "Could not compute Egger's test (possibly too few studies)."
+          } else {
+            paste0("Egger's test for small-study effects: p = ",
+                   sprintf("%.4f", bias_res$p.value))
+          }
+        }
+      })
+      
+    } else {
+      output$forestplot <- renderPlot({
+        plot.new()
+        text(0.5, 0.5, "No meta-analysis: 'hr' or 'hr_se' columns not found.", cex = 1.2)
+      })
+      output$funnelplot <- renderPlot({
+        plot.new()
+        text(0.5, 0.5, "No funnel plot: 'hr' or 'hr_se' columns not found.", cex = 1.2)
+      })
+      output$metaSummary <- renderText({
+        "No meta-analysis results because 'hr' and/or 'hr_se' columns are missing."
+      })
+      output$biasTest <- renderText({
+        "No bias test possible without hazard ratio data."
+      })
+    }
+    
+    # Cox PH Analysis
+    if (input$runCoxPH) {
+      cox_formula <- as.formula("SurvObj ~ study")
+      cox_fit <- tryCatch({
+        coxph(cox_formula, data = df)
+      }, error = function(e) NULL)
+      cox_objects$cox_model <- cox_fit
+      
+      if (!is.null(cox_fit)) {
+        cox_objects$bh <- tryCatch({
+          basehaz(cox_fit, centered = FALSE)
+        }, error = function(e) NULL)
+      } else {
+        cox_objects$bh <- NULL
+      }
+      
+      output$coxSummary <- renderPrint({
+        if (is.null(cox_fit)) {
+          "Error in fitting Cox PH model."
+        } else {
+          summary(cox_fit)
+        }
+      })
+      
+      if (input$testPH && !is.null(cox_fit)) {
+        ph_test <- tryCatch({
+          cox.zph(cox_fit)
+        }, error = function(e) NULL)
+        cox_objects$ph_test <- ph_test
+        output$phTest <- renderPrint({
+          if (is.null(ph_test)) {
+            "Error in testing PH assumption."
+          } else {
+            ph_test
+          }
+        })
+      } else {
+        output$phTest <- renderPrint({ "Proportional-hazards assumption test not requested." })
+      }
+    } else {
+      output$coxSummary <- renderPrint({ "Cox PH model not requested." })
+      output$phTest <- renderPrint({ "Proportional-hazards assumption test not requested." })
+      cox_objects$bh <- NULL
+    }
+    
+  })
+  
+  # Cox Diagnostics and Detailed Summaries
+  output$coxDetails <- renderPrint({
+    if (!is.null(cox_objects$cox_model)) {
+      cat("Detailed Cox Model Summary:\n")
+      print(summary(cox_objects$cox_model))
+    } else {
+      cat("Cox model not available.")
+    }
+  })
+  
+  output$schoenfeldPlot <- renderPlot({
+    req(input$showSchoenfeld)
+    if (!is.null(cox_objects$cox_model)) {
+      ph_res <- tryCatch({
+        cox.zph(cox_objects$cox_model)
+      }, error = function(e) NULL)
+      if (!is.null(ph_res)) {
+        p_schoen <- ggcoxzph(ph_res)
+        if ("list" %in% class(p_schoen)) {
+          for (i in seq_along(p_schoen)) print(p_schoen[[i]])
+        } else {
+          print(p_schoen)
+        }
+      } else {
+        plot.new()
+        text(0.5, 0.5, "Error computing Schoenfeld residuals.", cex = 1.5)
+      }
+    } else {
+      plot.new()
+      text(0.5, 0.5, "Cox model not available.", cex = 1.5)
+    }
+  })
+  
+  output$baselineHazardPlot <- renderPlot({
+    req(input$showBaselineHazard)
+    if (!is.null(cox_objects$cox_model)) {
+      if (!is.null(cox_objects$bh)) {
+        bh <- cox_objects$bh
+        plot(bh$time, bh$hazard, type = "l", xlab = "Time",
+             ylab = "Baseline Hazard", main = "Baseline Hazard Plot")
+      } else {
+        plot.new()
+        text(0.5, 0.5, "No baseline hazard data available.", cex = 1.5)
+      }
+    } else {
+      plot.new()
+      text(0.5, 0.5, "Cox model not available.", cex = 1.5)
+    }
+  })
+  
+  output$martingalePlot <- renderPlot({
+    req(input$showMartingale)
+    if (!is.null(cox_objects$cox_model)) {
+      mres <- tryCatch({
+        residuals(cox_objects$cox_model, type = "martingale")
+      }, error = function(e) NULL)
+      if (!is.null(mres)) {
+        linpred <- cox_objects$cox_model$linear.predictors
+        plot(linpred, mres, xlab = "Linear Predictor", ylab = "Martingale Residual",
+             main = "Martingale Residual Plot")
+        abline(h = 0, col = "red", lty = 2)
+      } else {
+        plot.new()
+        text(0.5, 0.5, "Error computing martingale residuals.", cex = 1.5)
+      }
+    } else {
+      plot.new()
+      text(0.5, 0.5, "Cox model not available.", cex = 1.5)
+    }
+  })
+  
+  output$kmFitIndividualSummary <- renderPrint({
+    if (!is.null(survfits$fit_individual)) {
+      summary(survfits$fit_individual)
+    } else {
+      "No individual KM fit available."
+    }
+  })
+  
+  output$kmFitPooledSummary <- renderPrint({
+    if (!is.null(survfits$fit_pooled)) {
+      summary(survfits$fit_pooled)
+    } else {
+      "No pooled KM fit available."
+    }
+  })
+  
+  output$metaObjectPrint <- renderPrint({
+    if (!is.null(meta_objects$meta_res)) {
+      meta_objects$meta_res
+    } else {
+      "No meta-analysis object available."
+    }
+  })
+  
+  output$coxBaselineHazardPrint <- renderPrint({
+    if (!is.null(cox_objects$bh)) {
+      cox_objects$bh
+    } else {
+      "No baseline hazard data computed."
+    }
+  })
+  
+  output$timeHistogram <- renderPlot({
+    df <- data()
+    p <- ggplot(df, aes(x = time)) +
+      geom_histogram(aes(y = after_stat(density)), bins = 15, fill = "steelblue", alpha = 0.6) +
+      xlab("Time") + ylab("Density") + ggtitle("Histogram of Time-to-Event")
+    if (input$showDensity) {
+      p <- p + geom_density(color = "red", linewidth = 1)
+    }
+    print(p)
+  })
+  
+  output$boxplotByStudy <- renderPlot({
+    df <- data()
+    df$study <- as.factor(df$study)
+    p <- ggplot(df, aes(x = study, y = time)) +
+      geom_boxplot(fill = "lightgreen", alpha = 0.6) +
+      xlab("Study") + ylab("Time") + ggtitle("Boxplot of Time by Study")
+    print(p)
+  })
+  
+  output$downloadKMIndividual <- downloadHandler(
+    filename = function() { paste0("KM_Individual_", Sys.Date(), ".png") },
+    content = function(file) {
+      png(file, width = 1200, height = 800, res = 120)
+      if (!is.null(survfits$kmplot_ind)) print(survfits$kmplot_ind)
+      dev.off()
+    }
+  )
+  
+  output$downloadKMPooled <- downloadHandler(
+    filename = function() { paste0("KM_Pooled_", Sys.Date(), ".png") },
+    content = function(file) {
+      png(file, width = 1200, height = 800, res = 120)
+      if (!is.null(survfits$kmplot_pool)) print(survfits$kmplot_pool)
+      dev.off()
+    }
+  )
+  
+  output$downloadCumhaz <- downloadHandler(
+    filename = function() { paste0("CumHaz_", Sys.Date(), ".png") },
+    content = function(file) {
+      png(file, width = 1200, height = 800, res = 120)
+      if (!is.null(survfits$cumhaz_plot)) print(survfits$cumhaz_plot)
+      dev.off()
+    }
+  )
+  
+  output$downloadLoglog <- downloadHandler(
+    filename = function() { paste0("LogLog_", Sys.Date(), ".png") },
+    content = function(file) {
+      png(file, width = 1200, height = 800, res = 120)
+      if (!is.null(survfits$loglog_plot)) print(survfits$loglog_plot)
+      dev.off()
+    }
+  )
+  
+  output$downloadForest <- downloadHandler(
+    filename = function() { paste0("ForestPlot_", Sys.Date(), ".png") },
+    content = function(file) {
+      if (!is.null(meta_objects$meta_res)) {
+        png(file, width = 1200, height = 800, res = 120)
+        if (input$backtransf) {
+          if(input$forestPlotStyle == "Modern"){
+            extraArgs <- list(colgap.forest = "2cm", colgap.study = "1cm")
+          } else {
+            extraArgs <- list()
+          }
+          do.call(forest, c(list(meta_objects$meta_res,
+                                 backtransf = TRUE,
+                                 leftlabs = meta_data$study,
+                                 xlim = input$forestXRangeHR,
+                                 xlab = input$forestXLabelHR,
+                                 main = input$forestTitleHR,
+                                 col.study = input$forestStudyColor,
+                                 col.square = input$forestSquareColor,
+                                 col.diamond = input$forestDiamondColor,
+                                 col.diamond.lines = input$forestDiamondLineColor,
+                                 cex = input$forestTextSize,
+                                 lwd = input$forestLwd),
+                            extraArgs))
+        } else {
+          if(input$forestPlotStyle == "Modern"){
+            extraArgs <- list(colgap.forest = "2cm", colgap.study = "1cm")
+          } else {
+            extraArgs <- list()
+          }
+          do.call(forest, c(list(meta_objects$meta_res,
+                                 leftlabs = meta_data$study,
+                                 xlim = input$forestXRange,
+                                 xlab = input$forestXLabel,
+                                 main = input$forestTitle,
+                                 col.study = input$forestStudyColor,
+                                 col.square = input$forestSquareColor,
+                                 col.diamond = input$forestDiamondColor,
+                                 col.diamond.lines = input$forestDiamondLineColor,
+                                 cex = input$forestTextSize,
+                                 lwd = input$forestLwd),
+                            extraArgs))
+        }
+        dev.off()
+      } else {
+        showNotification("No meta-analysis available for Forest Plot download.", type = "warning")
+      }
+    }
+  )
+  
+  output$downloadFunnel <- downloadHandler(
+    filename = function() { paste0("FunnelPlot_", Sys.Date(), ".png") },
+    content = function(file) {
+      if (!is.null(meta_objects$meta_res)) {
+        png(file, width = 1200, height = 800, res = 120)
+        if (input$backtransf) {
+          funnel(meta_objects$meta_res,
+                 backtransf = TRUE,
+                 xlim = input$funnelXRangeHR,
+                 xlab = input$funnelXLabelHR,
+                 main = input$funnelTitleHR,
+                 col = input$funnelColor,
+                 cex = input$funnelTextSize,
+                 lwd = input$funnelLwd,
+                 pch = as.numeric(input$funnelPch))
+        } else {
+          funnel(meta_objects$meta_res,
+                 xlim = input$funnelXRange,
+                 xlab = input$funnelXLabel,
+                 main = input$funnelTitle,
+                 col = input$funnelColor,
+                 cex = input$funnelTextSize,
+                 lwd = input$funnelLwd,
+                 pch = as.numeric(input$funnelPch))
+        }
+        dev.off()
+      } else {
+        showNotification("No meta-analysis available for Funnel Plot download.", type = "warning")
+      }
+    }
+  )
+}
+
+shinyApp(ui, server)
