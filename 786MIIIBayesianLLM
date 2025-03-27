@@ -1,0 +1,640 @@
+# Load required libraries
+library(shiny)
+library(bs4Dash)
+library(DT)
+library(readr)
+library(readxl)
+library(dplyr)
+library(httr)
+library(jsonlite)
+library(gemtc)  # For Bayesian NMA
+
+# Set your API key (replace with your actual key if needed)
+api_key <- "AIzaSyDLyY_CBROavHzTXRgTN_4WVCuy4rexsE8"
+
+#------------------------------------------------------------------
+# Helper Functions
+#------------------------------------------------------------------
+
+# Function to call the Gemini API using your API key
+generate_content <- function(prompt, api_key) {
+  print(paste0("Calling Gemini API with prompt: ", substr(prompt, 1, 100), "..."))
+  url <- paste0("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=", api_key)
+  body <- list(contents = list(list(parts = list(list(text = prompt)))))
+  res <- POST(url,
+              body = toJSON(body, auto_unbox = TRUE),
+              encode = "json",
+              add_headers(`Content-Type` = "application/json"))
+  status <- status_code(res)
+  rawContent <- content(res, as = "text", encoding = "UTF-8")
+  parsed <- fromJSON(rawContent, simplifyVector = FALSE)
+  
+  generated <- ""
+  if (!is.null(parsed$candidates) && length(parsed$candidates) > 0) {
+    candidate <- parsed$candidates[[1]]
+    if (!is.null(candidate$content) &&
+        !is.null(candidate$content$parts) &&
+        length(candidate$content$parts) > 0 &&
+        !is.null(candidate$content$parts[[1]]$text)) {
+      generated <- candidate$content$parts[[1]]$text
+    }
+  }
+  list(status = status, raw = rawContent, generated = generated)
+}
+
+# Function to clean markdown formatting (removes asterisks)
+clean_markdown <- function(text) {
+  text <- gsub("\\*\\*", "", text)
+  text <- gsub("\\*", "", text)
+  text
+}
+
+#------------------------------------------------------------------
+# Sample Data Definitions
+#------------------------------------------------------------------
+
+# Continuous outcome sample data
+sampleDataCont <- data.frame(
+  study = rep(paste("Study", 1:5), each = 2),
+  treatment = c("Drug_A", "Placebo",
+                "Drug_B", "Placebo",
+                "Drug_C", "Placebo",
+                "Drug_A", "Drug_B",
+                "Drug_C", "Drug_D"),
+  mean = c(5.2, 7.0, 4.8, 6.5, 5.5, 7.2, 5.0, 6.0, 5.8, 6.5),
+  sd = c(1.2, 1.0, 1.5, 1.3, 1.1, 1.0, 1.3, 1.2, 1.4, 1.3),
+  samplesize = c(50, 50, 60, 60, 55, 55, 50, 50, 45, 45),
+  covariate = c(3, 3, 2.5, 2.5, 4, 4, 3, 3, 4.5, 4.5),
+  study_design = c("RCT", "RCT", "RCT", "RCT", "RCT", "RCT", "Obs", "Obs", "Obs", "Obs"),
+  stringsAsFactors = FALSE
+)
+# Rename for display/download:
+sampleDataContDisplay <- sampleDataCont %>% 
+  rename(sampleSize = samplesize,
+         `std.dev` = sd)
+
+# Binary outcome sample data
+sampleDataBin <- data.frame(
+  study = rep(paste("Study", 1:5), each = 2),
+  treatment = c("Drug_A", "Placebo",
+                "Drug_B", "Placebo",
+                "Drug_C", "Placebo",
+                "Drug_A", "Drug_B",
+                "Drug_C", "Drug_D"),
+  responders = c(30, 20, 25, 15, 28, 12, 27, 18, 22, 10),
+  samplesize = c(50, 50, 60, 60, 55, 55, 50, 50, 45, 45),
+  covariate = c(3, 3, 2.5, 2.5, 4, 4, 3, 3, 4.5, 4.5),
+  study_design = c("RCT", "RCT", "RCT", "RCT", "RCT", "RCT", "Obs", "Obs", "Obs", "Obs"),
+  stringsAsFactors = FALSE
+)
+sampleDataBinDisplay <- sampleDataBin %>% 
+  rename(sampleSize = samplesize)
+
+# Survival outcome sample data
+sampleDataHR <- data.frame(
+  study = rep(paste("Study", 1:5), each = 2),
+  treatment = c("Drug_A", "Placebo",
+                "Drug_B", "Placebo",
+                "Drug_C", "Placebo",
+                "Drug_A", "Drug_B",
+                "Drug_C", "Drug_D"),
+  responders = c(10, 15, 12, 12, 11, 20, 13, 17, 14, 19),
+  exposure = c(100, 100, 120, 120, 110, 110, 100, 100, 90, 90),
+  covariate = c(3, 3, 2.5, 2.5, 4, 4, 3, 3, 4.5, 4.5),
+  study_design = c("RCT", "RCT", "RCT", "RCT", "RCT", "RCT", "Obs", "Obs", "Obs", "Obs"),
+  stringsAsFactors = FALSE
+)
+
+#------------------------------------------------------------------
+# UI
+#------------------------------------------------------------------
+
+ui <- bs4DashPage(
+  title = "Bayesian NMA & LLM Interpretation App",
+  header = bs4DashNavbar(
+    title = bs4DashBrand(title = "Bayesian NMA & LLM", color = "primary"),
+    skin = "light"
+  ),
+  sidebar = bs4DashSidebar(
+    skin = "light",
+    status = "primary",
+    title = "Navigation",
+    bs4SidebarMenu(
+      bs4SidebarMenuItem("Bayesian NMA", tabName = "nma", icon = icon("project-diagram")),
+      bs4SidebarMenuItem("Data Table", tabName = "data", icon = icon("table")),
+      bs4SidebarMenuItem("Advanced Analysis", tabName = "advanced", icon = icon("chart-line"))
+    )
+  ),
+  body = bs4DashBody(
+    tabItems(
+      # Bayesian NMA Tab
+      tabItem(
+        tabName = "nma",
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("upload"), "Upload NMA Data"),
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            fileInput("nmaData", "Choose CSV/Excel File (arm-based format)", 
+                      accept = c(".csv", ".xlsx"))
+          )
+        ),
+        # Outcome Type & Summary Measure selection
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("sliders-h"), "Outcome Type & Summary Measure"),
+            status = "info",
+            solidHeader = TRUE,
+            width = 12,
+            radioButtons("outcomeType", "Outcome Type",
+                         choices = c("Continuous" = "cont",
+                                     "Binary" = "bin",
+                                     "Survival" = "hr"),
+                         selected = "cont"),
+            uiOutput("summaryMeasureUI")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("play-circle"), "Run Bayesian NMA"),
+            status = "success",
+            solidHeader = TRUE,
+            width = 6,
+            actionButton("runNMA", "Run NMA", icon = icon("cogs"))
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("file-alt"), "NMA Summary"),
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            verbatimTextOutput("nmaSummary")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("magic"), "Generate LLM Interpretation"),
+            status = "success",
+            solidHeader = TRUE,
+            width = 12,
+            actionButton("generateLLM", "Generate Interpretation", icon = icon("magic")),
+            br(), br(),
+            htmlOutput("generatedLLM")
+          )
+        ),
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("bug"), "Debug Output"),
+            status = "danger",
+            solidHeader = TRUE,
+            collapsible = TRUE,
+            width = 12,
+            verbatimTextOutput("debugOutput")
+          )
+        )
+      ),
+      # Data Table Tab with separate sample CSV files
+      tabItem(
+        tabName = "data",
+        tabsetPanel(
+          tabPanel("Continuous", 
+                   DTOutput("dataTableCont"),
+                   downloadButton("downloadSampleCont", "Download Continuous Sample CSV", icon = icon("download"))
+          ),
+          tabPanel("Binary", 
+                   DTOutput("dataTableBin"),
+                   downloadButton("downloadSampleBin", "Download Binary Sample CSV", icon = icon("download"))
+          ),
+          tabPanel("Survival", 
+                   DTOutput("dataTableHR"),
+                   downloadButton("downloadSampleHR", "Download Survival Sample CSV", icon = icon("download"))
+          )
+        )
+      ),
+      # Advanced Analysis Tab
+      tabItem(
+        tabName = "advanced",
+        fluidRow(
+          bs4Card(
+            title = tagList(icon("chart-line"), "Advanced Analyses"),
+            status = "info",
+            solidHeader = TRUE,
+            width = 12,
+            actionButton("runNodeSplit", "Run Node-Split Analysis", icon = icon("project-diagram")),
+            actionButton("runRanking", "Calculate Ranking Probabilities", icon = icon("sort-numeric-up")),
+            actionButton("runRelativeEffects", "Generate Relative Effects Table", icon = icon("table")),
+            actionButton("runHeterogeneity", "Run Heterogeneity Analysis", icon = icon("chart-area")),
+            actionButton("plotCovEffect", "Plot Covariate Effects", icon = icon("chart-line")),
+            br(), br(),
+            verbatimTextOutput("advancedOutput"),
+            br(),
+            actionButton("generateAdvLLM", "Generate Advanced LLM Interpretation", icon = icon("magic")),
+            br(), br(),
+            htmlOutput("advancedLLMOutput"),
+            br(),
+            plotOutput("covEffectPlot", height = "400px")
+          )
+        )
+      )
+    )
+  ),
+  footer = bs4DashFooter(left = "© 2025 Bayesian NMA & LLM App")
+)
+
+#------------------------------------------------------------------
+# Server
+#------------------------------------------------------------------
+
+server <- function(input, output, session) {
+  debugInfo      <- reactiveVal("")
+  nmaSummaryText <- reactiveVal("")
+  llmOutput      <- reactiveVal("")
+  advancedOutput <- reactiveVal("")
+  
+  # Reactive values to store network and MCMC result objects
+  networkObj <- reactiveVal(NULL)
+  resultObj  <- reactiveVal(NULL)
+  
+  appendDebug <- function(msg) {
+    new_debug <- paste(debugInfo(), msg, sep = "\n")
+    debugInfo(new_debug)
+    message("[DEBUG] ", msg)
+  }
+  
+  # Dynamically generate summary measure UI based on outcome type
+  output$summaryMeasureUI <- renderUI({
+    if (input$outcomeType == "cont") {
+      radioButtons("summaryMeasure", "Summary Measure",
+                   choices = c("Mean Difference (MD)" = "MD",
+                               "Standardized Mean Difference (SMD)" = "SMD"),
+                   selected = "MD")
+    } else if (input$outcomeType == "bin") {
+      radioButtons("summaryMeasure", "Summary Measure",
+                   choices = c("Risk Ratio (RR)" = "RR",
+                               "Odds Ratio (OR)" = "OR"),
+                   selected = "RR")
+    } else if (input$outcomeType == "hr") {
+      tags$p("Summary Measure: Hazard Ratio (HR) will be used.")
+    }
+  })
+  
+  # Display sample data for each outcome type
+  output$dataTableCont <- renderDT({
+    datatable(sampleDataContDisplay, options = list(pageLength = 10))
+  })
+  output$dataTableBin <- renderDT({
+    datatable(sampleDataBinDisplay, options = list(pageLength = 10))
+  })
+  output$dataTableHR <- renderDT({
+    datatable(sampleDataHR, options = list(pageLength = 10))
+  })
+  
+  output$downloadSampleCont <- downloadHandler(
+    filename = function() { "sample_nma_cont.csv" },
+    content = function(file) {
+      write.csv(sampleDataContDisplay, file, row.names = FALSE)
+    }
+  )
+  output$downloadSampleBin <- downloadHandler(
+    filename = function() { "sample_nma_bin.csv" },
+    content = function(file) {
+      write.csv(sampleDataBinDisplay, file, row.names = FALSE)
+    }
+  )
+  output$downloadSampleHR <- downloadHandler(
+    filename = function() { "sample_nma_hr.csv" },
+    content = function(file) {
+      write.csv(sampleDataHR, file, row.names = FALSE)
+    }
+  )
+  
+  # Run Bayesian NMA when the Run NMA button is clicked
+  observeEvent(input$runNMA, {
+    appendDebug("Run NMA button clicked.")
+    req(input$nmaData)
+    ext <- tools::file_ext(input$nmaData$name)
+    appendDebug(paste("Uploaded file extension:", ext))
+    
+    nma_data <- tryCatch({
+      if(ext == "csv") {
+        read_csv(input$nmaData$datapath)
+      } else if(ext %in% c("xls", "xlsx")) {
+        read_excel(input$nmaData$datapath)
+      } else {
+        NULL
+      }
+    }, error = function(e) {
+      appendDebug(paste("Error reading file:", e$message))
+      NULL
+    })
+    
+    if(is.null(nma_data)) {
+      nmaSummaryText("Unable to read the uploaded data. Please check the file format.")
+      appendDebug("Data upload failed.")
+      return()
+    } else {
+      appendDebug("Data successfully uploaded.")
+    }
+    
+    nma_data <- nma_data %>% rename_all(tolower)
+    appendDebug(paste("Data columns:", paste(colnames(nma_data), collapse = ", ")))
+    
+    # Outcome-specific renaming and required columns
+    if (input$outcomeType == "cont") {
+      if("samplesize" %in% names(nma_data)){
+        nma_data <- nma_data %>% rename(sampleSize = samplesize)
+        appendDebug("Renamed 'samplesize' to 'sampleSize'.")
+      }
+      if("sd" %in% names(nma_data)){
+        nma_data <- nma_data %>% rename(`std.dev` = sd)
+        appendDebug("Renamed 'sd' to 'std.dev'.")
+      }
+      requiredCols <- c("study", "treatment", "mean", "std.dev", "sampleSize")
+    } else if (input$outcomeType == "bin") {
+      if("samplesize" %in% names(nma_data)){
+        nma_data <- nma_data %>% rename(sampleSize = samplesize)
+        appendDebug("Renamed 'samplesize' to 'sampleSize'.")
+      }
+      requiredCols <- c("study", "treatment", "responders", "sampleSize")
+    } else if (input$outcomeType == "hr") {
+      requiredCols <- c("study", "treatment", "responders", "exposure")
+    }
+    
+    missingCols <- setdiff(requiredCols, names(nma_data))
+    if(length(missingCols) > 0){
+      nmaSummaryText(paste("Missing required columns:", paste(missingCols, collapse = ", ")))
+      appendDebug(paste("Missing columns:", paste(missingCols, collapse = ", ")))
+      return()
+    }
+    
+    if("covariate" %in% names(nma_data)) {
+      nma_data$covariate <- as.numeric(nma_data$covariate)
+    }
+    
+    nma_data$treatment <- gsub(" ", "_", nma_data$treatment)
+    nma_data$treatment <- gsub("[^A-Za-z0-9_]", "", nma_data$treatment)
+    
+    # Create study-level covariate data if available
+    covData <- NULL
+    if("covariate" %in% names(nma_data)) {
+      covData <- nma_data %>% select(study, covariate) %>% distinct()
+      appendDebug(paste("Covariate data columns:", paste(colnames(covData), collapse = ", ")))
+    }
+    
+    network <- tryCatch({
+      if(!is.null(covData)) {
+        mtc.network(data.ab = nma_data, studies = covData)
+      } else {
+        mtc.network(data.ab = nma_data)
+      }
+    }, error = function(e) {
+      appendDebug(paste("Error constructing network:", e$message))
+      NULL
+    })
+    
+    if(is.null(network)) {
+      nmaSummaryText("Failed to construct Bayesian network meta-analysis object.")
+      return()
+    } else {
+      appendDebug("Bayesian network meta-analysis object constructed.")
+      networkObj(network)
+    }
+    
+    model <- tryCatch({
+      if (input$outcomeType == "cont") {
+        if("covariate" %in% names(network$studies)) {
+          mtc.model(network, 
+                    type = "regression",
+                    regressor = list(variable = "covariate", coefficient = "shared", control = network$treatments$id[1]),
+                    linearModel = "random", 
+                    likelihood = "normal", 
+                    link = "identity")
+        } else {
+          mtc.model(network, 
+                    linearModel = "random", 
+                    likelihood = "normal", 
+                    link = "identity")
+        }
+      } else if (input$outcomeType == "bin") {
+        if(input$summaryMeasure == "RR") {
+          linkfun <- "log"  # risk ratio
+        } else {
+          linkfun <- "logit"  # odds ratio
+        }
+        mtc.model(network, 
+                  linearModel = "random", 
+                  likelihood = "binom", 
+                  link = linkfun)
+      } else if (input$outcomeType == "hr") {
+        mtc.model(network, 
+                  linearModel = "random", 
+                  likelihood = "poisson", 
+                  link = "log")
+      }
+    }, error = function(e) {
+      appendDebug(paste("Error constructing model:", e$message))
+      NULL
+    })
+    
+    if(is.null(model)) {
+      nmaSummaryText("Failed to construct Bayesian NMA model.")
+      return()
+    } else {
+      appendDebug("Bayesian NMA model constructed.")
+    }
+    
+    result <- tryCatch({
+      mtc.run(model)
+    }, error = function(e) {
+      appendDebug(paste("Error running MCMC:", e$message))
+      NULL
+    })
+    
+    if(is.null(result)) {
+      nmaSummaryText("Bayesian NMA model run failed.")
+      return()
+    } else {
+      appendDebug("MCMC run completed.")
+      resultObj(result)
+    }
+    
+    summaryText <- paste(capture.output(summary(result)), collapse = "\n")
+    nmaSummaryText(summaryText)
+  })
+  
+  output$nmaSummary <- renderText({
+    nmaSummaryText()
+  })
+  
+  # Advanced Analysis: Node-Split Analysis
+  observeEvent(input$runNodeSplit, {
+    appendDebug("Run Node-Split Analysis button clicked.")
+    if(is.null(networkObj())) {
+      advancedOutput("Network object not available. Run the NMA first.")
+      return()
+    }
+    nodeSplitResults <- tryCatch({
+      mtc.nodesplit(networkObj(), comparisons = mtc.nodesplit.comparisons(networkObj()))
+    }, error = function(e) {
+      appendDebug(paste("Error running node-split analysis:", e$message))
+      NULL
+    })
+    if(is.null(nodeSplitResults)) {
+      advancedOutput("Node-split analysis failed.")
+    } else {
+      advancedOutput(paste(capture.output(summary(nodeSplitResults)), collapse = "\n"))
+    }
+  })
+  
+  # Advanced Analysis: Ranking Probabilities
+  observeEvent(input$runRanking, {
+    appendDebug("Run Ranking Analysis button clicked.")
+    if(is.null(resultObj())) {
+      advancedOutput("MCMC result not available. Run the NMA first.")
+      return()
+    }
+    ranks <- tryCatch({
+      rank.probability(resultObj())
+    }, error = function(e) {
+      appendDebug(paste("Error calculating ranking probabilities:", e$message))
+      NULL
+    })
+    if(is.null(ranks)) {
+      advancedOutput("Ranking analysis failed.")
+    } else {
+      advancedOutput(paste("Rank Probabilities:\n", paste(capture.output(print(ranks)), collapse = "\n")))
+    }
+  })
+  
+  # Advanced Analysis: Relative Effects Table
+  observeEvent(input$runRelativeEffects, {
+    appendDebug("Run Relative Effects Table button clicked.")
+    if(is.null(resultObj())) {
+      advancedOutput("MCMC result not available. Run the NMA first.")
+      return()
+    }
+    relEffTable <- tryCatch({
+      relative.effect.table(resultObj())
+    }, error = function(e) {
+      appendDebug(paste("Error generating relative effects table:", e$message))
+      NULL
+    })
+    if(is.null(relEffTable)) {
+      advancedOutput("Relative effects table generation failed.")
+    } else {
+      advancedOutput(paste("Relative Effects Table:\n", paste(capture.output(print(relEffTable)), collapse = "\n")))
+    }
+  })
+  
+  # Advanced Analysis: Heterogeneity Analysis using mtc.anohe
+  observeEvent(input$runHeterogeneity, {
+    appendDebug("Run Heterogeneity Analysis button clicked.")
+    if(is.null(networkObj())) {
+      advancedOutput("Network object not available. Run the NMA first.")
+      return()
+    }
+    heteroRes <- tryCatch({
+      mtc.anohe(networkObj())
+    }, error = function(e) {
+      appendDebug(paste("Error running heterogeneity analysis:", e$message))
+      NULL
+    })
+    if(is.null(heteroRes)) {
+      advancedOutput("Heterogeneity analysis failed.")
+    } else {
+      advancedOutput(paste("Heterogeneity Analysis Summary:\n", paste(capture.output(summary(heteroRes)), collapse = "\n")))
+    }
+  })
+  
+  # Advanced Analysis: Plot Covariate Effects (if regression model and covariate available)
+  observeEvent(input$plotCovEffect, {
+    appendDebug("Plot Covariate Effects button clicked.")
+    if(is.null(resultObj())) {
+      advancedOutput("MCMC result not available. Run the NMA first.")
+      return()
+    }
+    # Check if covariate was used
+    if(is.null(networkObj()$studies) || !"covariate" %in% names(networkObj()$studies)) {
+      advancedOutput("No covariate data available for plotting.")
+      return()
+    }
+    # Use the first treatment as baseline and plot effects for all others (excluding baseline)
+    baseline <- networkObj()$treatments$id[1]
+    otherTreatments <- setdiff(networkObj()$treatments$id, baseline)
+    # Capture the plot into a reactive plot output
+    output$covEffectPlot <- renderPlot({
+      tryCatch({
+        plotCovariateEffect(resultObj(), t1 = baseline, t2 = otherTreatments,
+                            xlim = NULL, ylim = NULL)
+      }, error = function(e) {
+        plot.new()
+        text(0.5, 0.5, paste("Error in plotting covariate effects:", e$message))
+      })
+    })
+  })
+  
+  output$advancedOutput <- renderText({
+    advancedOutput()
+  })
+  
+  # Generate Advanced Analysis LLM Interpretation
+  observeEvent(input$generateAdvLLM, {
+    appendDebug("Generate Advanced LLM Interpretation button clicked.")
+    req(advancedOutput())
+    advPrompt <- paste("Based on the following advanced analysis results, provide a detailed interpretation with clinical insights:\n\n", advancedOutput())
+    appendDebug(paste("Constructed advanced prompt (first 100 chars):", substr(advPrompt, 1, 100)))
+    advRes <- generate_content(advPrompt, api_key)
+    appendDebug(paste("Gemini API status code:", advRes$status))
+    appendDebug("Gemini API raw response (advanced):")
+    appendDebug(advRes$raw)
+    if (!is.null(advRes$generated) && advRes$generated != "") {
+      outputText <- clean_markdown(advRes$generated)
+      # Update advanced LLM output
+      output$advancedLLMOutput <- renderUI({
+        tags$div(style = "text-align: justify; white-space: pre-wrap;", outputText)
+      })
+      appendDebug("Advanced LLM interpretation received and processed.")
+    } else {
+      output$advancedLLMOutput <- renderUI({
+        tags$div("No generated content received. Please check the API response.")
+      })
+      appendDebug("Advanced LLM interpretation was empty.")
+    }
+  })
+  
+  output$advancedLLMOutput <- renderUI({
+    tags$div()
+  })
+  
+  # Generate LLM Interpretation for basic NMA results
+  observeEvent(input$generateLLM, {
+    appendDebug("Generate LLM Interpretation button clicked.")
+    req(nmaSummaryText())
+    prompt <- paste("Based on the following Bayesian network meta-analysis results, provide a detailed interpretation with clinical insights:\n\n", nmaSummaryText())
+    appendDebug(paste("Constructed prompt (first 100 chars):", substr(prompt, 1, 100)))
+    res <- generate_content(prompt, api_key)
+    appendDebug(paste("Gemini API status code:", res$status))
+    appendDebug("Gemini API raw response:")
+    appendDebug(res$raw)
+    if (!is.null(res$generated) && res$generated != "") {
+      llmOutput(clean_markdown(res$generated))
+      appendDebug("LLM interpretation received and processed.")
+    } else {
+      llmOutput("No generated content received. Please check the API response.")
+      appendDebug("LLM interpretation was empty.")
+    }
+  })
+  
+  output$generatedLLM <- renderUI({
+    tags$div(style = "text-align: justify; white-space: pre-wrap;", llmOutput())
+  })
+  
+  output$debugOutput <- renderText({
+    debugInfo()
+  })
+}
+
+# Run the Shiny app
+shinyApp(ui, server)
