@@ -1,0 +1,567 @@
+library(shiny)
+library(shinythemes)
+library(meta)
+library(httr)
+library(bayesmeta)
+
+### Helper Functions ###
+appendWarning <- function(text) {
+  paste0(text, "\n\nWARNING: These results are LLM-generated and must be rewritten for publication. They carry a risk of hallucinations. 😂")
+}
+
+# Helper function that calls the Gemini API and appends a warning.
+polishAndWarn <- function(promptText) {
+  out <- tryCatch({
+    response <- POST(
+      url = paste0("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=",
+                   "AIzaSyAydG28jErd8P2JJ76nXtDVWk-OXcFXR6c"),
+      add_headers(`Content-Type` = "application/json"),
+      body = list(contents = list(list(parts = list(list(text = promptText))))),
+      encode = "json"
+    )
+    parsed <- content(response, "parsed")
+    candidate <- parsed$candidates[[1]]
+    pubText <- candidate$content$parts[[1]]$text
+    if (is.null(pubText) || pubText == "") {
+      pubText <- "No publication-ready text was generated."
+    }
+    # Remove any extra leading "Results" heading (case-insensitive)
+    pubText <- sub("(?i)^\\s*\\*?Results\\*?\\s*\n?", "", pubText, perl = TRUE)
+    pubText
+  }, error = function(e) {
+    paste("Error during API call:", e$message)
+  })
+  appendWarning(out)
+}
+
+# Helper function to call polishAndWarn() and then append the raw text.
+polishAndWarnWithRaw <- function(promptText, rawText) {
+  paste0(polishAndWarn(promptText), "\n\nRAW TEXT:\n", rawText)
+}
+
+# Helper function to translate text into plain language.
+translateForPublic <- function(text) {
+  polishAndWarn(paste("Translate the following into plain language for the public:", text))
+}
+
+### UI ###
+ui <- fluidPage(
+  theme = shinytheme("cyborg"),
+  titlePanel("786-MIII Proportions Forest Plot App"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload CSV file", accept = ".csv"),
+      helpText("CSV must contain columns: 'author', 'event', 'total'. Extra columns will be treated as moderators if present."),
+      
+      # Study and moderator selection
+      uiOutput("studySelector"),
+      uiOutput("moderatorSelector"),
+      
+      # Meta-analysis options
+      selectInput("sm", "Summary Measure", choices = c("PLOGIT"), selected = "PLOGIT"),
+      radioButtons("effectModel", "Effect Model", choices = c("FE", "RE"), selected = "RE"),
+      selectInput("method.tau", "Heterogeneity Estimator",
+                  choices = c("DL", "PM", "REML", "HS", "SJ"), selected = "DL"),
+      selectInput("poolMethod", "Pooling Method", choices = c("Inverse"), selected = "Inverse"),
+      
+      # Forest plot appearance
+      sliderInput("xlims", "X-axis Limits", min = -5, max = 5, value = c(-5, 5)),
+      checkboxInput("prediction", "Show prediction interval", FALSE),
+      textInput("plotTitle", "Forest Plot Title", "Forest Plot of Proportions"),
+      textInput("xlab", "X-axis Label", "Logit Proportion"),
+      
+      # Dropdowns for forest plot colours
+      selectInput("colDiamond", "Diamond Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "blue"),
+      selectInput("colDiamondLines", "Diamond Lines Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "black"),
+      selectInput("colSquare", "Square Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "red"),
+      selectInput("colSquareLines", "Square Lines Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "black"),
+      selectInput("colStudy", "Study Label Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "black"),
+      selectInput("colCircle", "Circle Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "black"),
+      selectInput("colCircleLines", "Circle Lines Colour",
+                  choices = c("black", "blue", "red", "green", "orange", "purple", "brown", "pink", "grey"),
+                  selected = "black"),
+      
+      numericInput("textsize", "Text Size (cex)", 1, min = 0.5, max = 3, step = 0.1),
+      numericInput("linewidth", "Line Width (lwd)", 1, min = 0.5, max = 5, step = 0.5),
+      numericInput("plotWidth", "Plot Width (px)", 800),
+      numericInput("plotHeight", "Plot Height (px)", 600),
+      
+      downloadButton("downloadPlot", "Download Forest Plot"),
+      
+      # Bayesian plot toggle (only run if checked)
+      checkboxInput("showBayesPlot", "Show Bayesian Plot (may take long)", FALSE)
+    ),
+    
+    mainPanel(
+      uiOutput("mainTabs")
+    )
+  )
+)
+
+### Server ###
+server <- function(input, output, session) {
+  
+  #### Base Data and Meta-Analysis ####
+  dataInput <- reactive({
+    req(input$file)
+    df <- read.csv(input$file$datapath, stringsAsFactors = FALSE)
+    validate(
+      need(all(c("author", "event", "total") %in% names(df)),
+           "CSV must contain columns: 'author', 'event', 'total'")
+    )
+    df
+  })
+  
+  output$studySelector <- renderUI({
+    req(dataInput())
+    df <- dataInput()
+    checkboxGroupInput("includeStudies", "Include Studies:",
+                       choices = unique(df$author),
+                       selected = unique(df$author))
+  })
+  
+  output$moderatorSelector <- renderUI({
+    req(dataInput())
+    df <- dataInput()
+    modCols <- setdiff(names(df), c("author", "event", "total"))
+    if(length(modCols) > 0) {
+      selectInput("moderators", "Select Moderators for Meta-Regression", choices = modCols, multiple = TRUE)
+    }
+  })
+  
+  filteredData <- reactive({
+    df <- dataInput()
+    if (!is.null(input$includeStudies) && length(input$includeStudies) > 0) {
+      df <- df[df$author %in% input$includeStudies, ]
+    }
+    df
+  })
+  
+  metaAnalysis <- reactive({
+    req(filteredData())
+    df <- filteredData()
+    metaprop(
+      event = df$event,
+      n = df$total,
+      studlab = df$author,
+      sm = input$sm,
+      data = df,
+      common = (input$effectModel == "FE"),
+      random = (input$effectModel == "RE"),
+      method = input$poolMethod,
+      method.tau = input$method.tau,
+      incr = 0.5,
+      method.incr = "all"
+    )
+  })
+  
+  #### Bayesian Analysis (Raw and LLM Text) ####
+  bayesData <- reactive({
+    req(filteredData())
+    df <- filteredData()
+    df$p <- (df$event + 0.5) / (df$total + 1)
+    df$logit <- log(df$p/(1-df$p))
+    df$var <- 1/(df$event + 0.5) + 1/((df$total - df$event) + 0.5)
+    df$se <- sqrt(df$var)
+    df
+  })
+  
+  bayesRes <- reactive({
+    req(bayesData())
+    bayesmeta(y = bayesData()$logit, sigma = bayesData()$se, labels = bayesData()$author)
+  })
+  
+  bayesSummaryText <- reactive({
+    req(bayesRes())
+    paste(capture.output(print(bayesRes())), collapse = "\n")
+  })
+  
+  publicationReadyBayes <- reactive({
+    req(bayesSummaryText())
+    prompt <- paste(
+      "Generate a complete, publication-ready Bayesian meta-analysis results section. Organize the text into clear paragraphs with proper line breaks without an extra 'Results' heading. Include posterior estimates, credible intervals, and key diagnostic statistics. Here is the Bayesian meta-analysis summary:\n\n",
+      bayesSummaryText()
+    )
+    polishAndWarnWithRaw(prompt, bayesSummaryText())
+  })
+  
+  #### Forest Plot and Related Outputs ####
+  output$forestPlot <- renderPlot({
+    req(metaAnalysis())
+    m.prop <- metaAnalysis()
+    args <- list(
+      xlab = input$xlab,
+      main = input$plotTitle,
+      col.diamond = input$colDiamond,
+      col.diamond.lines = input$colDiamondLines,
+      col.square = input$colSquare,
+      col.square.lines = input$colSquareLines,
+      col.study = input$colStudy,
+      col.circle = input$colCircle,
+      col.circle.lines = input$colCircleLines,
+      labstudies = "",
+      cex = input$textsize,
+      lwd = input$linewidth,
+      xlim = input$xlims,
+      prediction = input$prediction
+    )
+    do.call(forest, c(list(m.prop), args))
+  }, width = reactive(input$plotWidth), height = reactive(input$plotHeight))
+  
+  output$downloadPlot <- downloadHandler(
+    filename = function() {
+      paste("forest_plot_proportions_", Sys.Date(), ".png", sep = "")
+    },
+    content = function(file) {
+      png(file, width = input$plotWidth, height = input$plotHeight)
+      m.prop <- metaAnalysis()
+      args <- list(
+        xlab = input$xlab,
+        main = input$plotTitle,
+        col.diamond = input$colDiamond,
+        col.diamond.lines = input$colDiamondLines,
+        col.square = input$colSquare,
+        col.square.lines = input$colSquareLines,
+        col.study = input$colStudy,
+        col.circle = input$colCircle,
+        col.circle.lines = input$colCircleLines,
+        labstudies = "",
+        cex = input$textsize,
+        lwd = input$linewidth,
+        xlim = input$xlims,
+        prediction = input$prediction
+      )
+      do.call(forest, c(list(m.prop), args))
+      dev.off()
+    }
+  )
+  
+  output$metaSummary <- renderPrint({
+    req(metaAnalysis())
+    summary(metaAnalysis())
+  })
+  
+  output$hetro <- renderPrint({
+    req(metaAnalysis())
+    m.prop <- metaAnalysis()
+    cat("Egger's Test (linreg):\n")
+    biasTest <- metabias(m.prop, method.bias = "linreg")
+    print(biasTest)
+    cat("\nInfluence Analysis Summary (metainf):\n")
+    infAnalysis <- metainf(m.prop)
+    print(infAnalysis)
+    cat("\nHeterogeneity Statistics:\n")
+    heterogeneity_stats <- list(
+      "Cochrane's Q" = m.prop$Q,
+      "I2" = m.prop$I2,
+      "H2" = m.prop$H2,
+      "Tau^2" = m.prop$tau^2,
+      "Tau" = sqrt(m.prop$tau^2)
+    )
+    print(heterogeneity_stats)
+  })
+  
+  output$Baujatplot <- renderPlot({
+    req(metaAnalysis())
+    m.prop <- metaAnalysis()
+    baujat(m.prop)
+  }, width = reactive(input$plotWidth), height = reactive(input$plotHeight))
+  
+  output$downloadBaujat <- downloadHandler(
+    filename = function() {
+      paste("baujat_plot_", Sys.Date(), ".png", sep = "")
+    },
+    content = function(file) {
+      png(file, width = input$plotWidth, height = input$plotHeight)
+      m.prop <- metaAnalysis()
+      baujat(m.prop)
+      dev.off()
+    }
+  )
+  
+  output$Influence <- renderPlot({
+    req(metaAnalysis())
+    m.prop <- metaAnalysis()
+    infAnalysis <- metainf(m.prop)
+    plot(infAnalysis)
+  }, width = reactive(input$plotWidth), height = reactive(input$plotHeight))
+  
+  output$downloadInfluence <- downloadHandler(
+    filename = function() {
+      paste("influence_plot_", Sys.Date(), ".png", sep = "")
+    },
+    content = function(file) {
+      png(file, width = input$plotWidth, height = input$plotHeight)
+      m.prop <- metaAnalysis()
+      infAnalysis <- metainf(m.prop)
+      plot(infAnalysis)
+      dev.off()
+    }
+  )
+  
+  ### LLM-Generated Meta-analysis Text Results ###
+  metaSummaryText <- reactive({
+    req(metaAnalysis())
+    rawSummary <- capture.output(summary(metaAnalysis()))
+    paste(rawSummary, collapse = "\n")
+  })
+  
+  publicationReadyLancet <- reactive({
+    req(metaSummaryText())
+    prompt <- paste(
+      "Generate a complete, publication-ready results section in the style of The Lancet. Organize the text into clear paragraphs with proper line breaks without an extra 'Results' heading. Include details such as the number of studies, participants, events, pooled estimates with 95% CIs, and heterogeneity statistics. Here is the meta-analysis summary:\n\n",
+      metaSummaryText()
+    )
+    polishAndWarnWithRaw(prompt, metaSummaryText())
+  })
+  
+  publicationReadyNEJM <- reactive({
+    req(metaSummaryText())
+    prompt <- paste(
+      "Generate a complete, publication-ready results section in the style of the New England Journal of Medicine (NEJM). Organize the text into well-separated paragraphs with proper line breaks and do not include an extra 'Results' heading. Include key information such as the number of studies, total participants, events, the pooled prevalence estimate (with 95% CIs), and heterogeneity statistics. Here is the meta-analysis summary:\n\n",
+      metaSummaryText()
+    )
+    polishAndWarnWithRaw(prompt, metaSummaryText())
+  })
+  
+  publicationReadyCochrane <- reactive({
+    req(metaSummaryText())
+    prompt <- paste(
+      "Generate a complete, publication-ready results section in the style of a Cochrane review. Divide the text into clear paragraphs with proper line breaks and remove any extra 'Results' heading. Detail the number of studies, participants, events, the pooled effect estimate with 95% CIs, and heterogeneity measures (e.g., I², Q statistics). Here is the meta-analysis summary:\n\n",
+      metaSummaryText()
+    )
+    polishAndWarnWithRaw(prompt, metaSummaryText())
+  })
+  
+  publicationReadyPlain <- reactive({
+    req(metaSummaryText())
+    prompt <- paste(
+      "Generate a complete, publication-ready results section in plain language for the public. Organize the text into clear, well-spaced paragraphs with proper line breaks and do not include an extra 'Results' heading. Explain the meta-analysis findings in simple terms, including the number of studies, participants, events, key pooled results, and an explanation of heterogeneity. Here is the meta-analysis summary:\n\n",
+      metaSummaryText()
+    )
+    polishAndWarnWithRaw(prompt, metaSummaryText())
+  })
+  
+  output$resultsOutput <- renderUI({
+    req(publicationReadyLancet(), publicationReadyNEJM(), publicationReadyCochrane(), publicationReadyPlain())
+    HTML(paste0(
+      "<h2>Lancet Style Results</h2><p>", gsub("\n", "<br>", publicationReadyLancet()), "</p>",
+      "<h2>NEJM Style Results</h2><p>", gsub("\n", "<br>", publicationReadyNEJM()), "</p>",
+      "<h2>Cochrane Style Results</h2><p>", gsub("\n", "<br>", publicationReadyCochrane()), "</p>",
+      "<h2>Plain Language Results for the Public</h2><p>", gsub("\n", "<br>", publicationReadyPlain()), "</p>"
+    ))
+  })
+  
+  ### Sensitivity Analysis Results ###
+  sensitivityRaw <- reactive({
+    req(metaAnalysis())
+    capture.output(print(metainf(metaAnalysis())))
+  })
+  
+  publicationReadySensitivity <- reactive({
+    req(sensitivityRaw())
+    prompt <- paste(
+      "Generate a complete, publication-ready sensitivity analysis results section. Summarize the following leave-one-out (influence) analysis output in clear paragraphs with proper line breaks, without an extra 'Results' heading:\n\n",
+      paste(sensitivityRaw(), collapse = "\n")
+    )
+    polishAndWarnWithRaw(prompt, paste(sensitivityRaw(), collapse = "\n"))
+  })
+  
+  output$sensitivityOutput <- renderUI({
+    req(publicationReadySensitivity())
+    HTML(paste0("<h2>Sensitivity Analysis Results</h2><p>",
+                gsub("\n", "<br>", publicationReadySensitivity()), "</p><h3>For the Public:</h3><p>",
+                gsub("\n", "<br>", translateForPublic(publicationReadySensitivity())), "</p>"))
+  })
+  
+  ### Publication Bias Results (Conditional on >10 studies) ###
+  publicationBiasRaw <- reactive({
+    req(metaAnalysis())
+    m.prop <- metaAnalysis()
+    eggerTest <- capture.output(print(metabias(m.prop, method.bias = "linreg")))
+    beggTest <- capture.output(print(metabias(m.prop, method.bias = "rank")))
+    tfSummary <- capture.output(print(summary(trimfill(m.prop))))
+    paste("Egger's Test (linreg):\n", paste(eggerTest, collapse = "\n"),
+          "\nBegg's Test (rank):\n", paste(beggTest, collapse = "\n"),
+          "\nTrim and Fill Adjusted Summary:\n", paste(tfSummary, collapse = "\n"))
+  })
+  
+  publicationReadyBias <- reactive({
+    req(publicationBiasRaw())
+    prompt <- paste(
+      "Generate a complete, publication-ready publication bias results section. Organize the text into clear paragraphs with proper line breaks and do not include an extra 'Results' heading. Here is the raw publication bias analysis summary:\n\n",
+      publicationBiasRaw()
+    )
+    polishAndWarnWithRaw(prompt, publicationBiasRaw())
+  })
+  
+  output$biasOutput <- renderUI({
+    req(publicationReadyBias())
+    HTML(paste0("<h2>Publication Bias Results</h2><p>",
+                gsub("\n", "<br>", publicationReadyBias()), "</p><h3>For the Public:</h3><p>",
+                gsub("\n", "<br>", translateForPublic(publicationReadyBias())), "</p>"))
+  })
+  
+  ### Meta-Regression (Conditional on >10 studies and moderator data) ###
+  metaReg <- reactive({
+    req(metaAnalysis(), input$moderators)
+    if (length(input$moderators) >= 1) {
+      fmla <- as.formula(paste("~", paste(input$moderators, collapse = "+")))
+      metareg(metaAnalysis(), fmla)
+    }
+  })
+  
+  publicationReadyMetaRegPublic <- reactive({
+    req(metaReg())
+    translateForPublic(capture.output(print(summary(metaReg()))))
+  })
+  
+  output$metaRegText <- renderUI({
+    req(metaReg())
+    metaRegSummaryRaw <- capture.output(summary(metaReg()))
+    prompt <- paste("Generate a publication-ready meta-regression analysis results section that summarizes the following output in clear academic language:\n\n",
+                    paste(metaRegSummaryRaw, collapse = "\n"))
+    metaRegPolished <- polishAndWarnWithRaw(prompt, paste(metaRegSummaryRaw, collapse = "\n"))
+    HTML(paste0("<h2>Meta-Regression Results</h2><p>",
+                gsub("\n", "<br>", metaRegPolished), "</p><h3>For the Public:</h3><p>",
+                gsub("\n", "<br>", publicationReadyMetaRegPublic()), "</p>"))
+  })
+  
+  output$metaRegPlot <- renderPlot({
+    req(metaReg(), input$metaregXlims)
+    bubble(metaReg(), xlim = input$metaregXlims)
+  }, width = reactive(input$plotWidth), height = reactive(input$plotHeight))
+  
+  output$downloadMetaRegPlot <- downloadHandler(
+    filename = function(){
+      paste("meta_regression_plot_", Sys.Date(), ".png", sep = "")
+    },
+    content = function(file) {
+      png(file, width = input$plotWidth, height = input$plotHeight)
+      bubble(metaReg(), xlim = input$metaregXlims)
+      dev.off()
+    }
+  )
+  
+  ### Bayesian Analysis Results ###
+  output$bayesTextOutput <- renderUI({
+    req(publicationReadyBayes())
+    HTML(paste0("<h2>Bayesian Analysis Results</h2><p>",
+                gsub("\n", "<br>", publicationReadyBayes()), "</p><h3>For the Public:</h3><p>",
+                gsub("\n", "<br>", publicationReadyBayesPublic()), "</p>"))
+  })
+  
+  output$bayesPlot <- renderPlot({
+    if (!input$showBayesPlot) return(NULL)
+    req(bayesRes())
+    plot(bayesRes())
+  }, width = reactive(input$plotWidth), height = reactive(input$plotHeight))
+  
+  output$downloadBayesPlot <- downloadHandler(
+    filename = function(){
+      paste("bayesian_plot_", Sys.Date(), ".png", sep = "")
+    },
+    content = function(file) {
+      if (!input$showBayesPlot) return(NULL)
+      png(file, width = input$plotWidth, height = input$plotHeight)
+      plot(bayesRes())
+      dev.off()
+    }
+  )
+  
+  ### Aggregated Final Report ("Full results") ###
+  publicationReadySensitivityPublic <- reactive({ translateForPublic(publicationReadySensitivity()) })
+  publicationReadyBiasPublic <- reactive({ translateForPublic(publicationReadyBias()) })
+  publicationReadyBayesPublic <- reactive({ translateForPublic(publicationReadyBayes()) })
+  
+  aggregatedFinal <- reactive({
+    req(publicationReadyLancet(), publicationReadyNEJM(), publicationReadyCochrane(),
+        publicationReadyPlain(), publicationReadySensitivity(), publicationReadyBayes())
+    aggregated_text <- paste(
+      "Lancet Style Results:\n", publicationReadyLancet(),
+      "\n\nNEJM Style Results:\n", publicationReadyNEJM(),
+      "\n\nCochrane Style Results:\n", publicationReadyCochrane(),
+      "\n\nPlain Language Results for the Public:\n", publicationReadyPlain(),
+      "\n\nSensitivity Analysis Results:\n", publicationReadySensitivity(),
+      "\nFor the Public (Sensitivity):\n", publicationReadySensitivityPublic()
+    )
+    if(metaAnalysis()$k > 10) {
+      aggregated_text <- paste(aggregated_text, "\n\nPublication Bias Results:\n", publicationReadyBias(),
+                               "\nFor the Public (Bias):\n", publicationReadyBiasPublic())
+    }
+    if(metaAnalysis()$k > 10 && !is.null(input$moderators) && length(input$moderators) > 0) {
+      aggregated_text <- paste(aggregated_text, "\n\nMeta-Regression Results:\n", capture.output(print(summary(metaReg()))),
+                               "\nFor the Public (Meta-Regression):\n", publicationReadyMetaRegPublic())
+    }
+    aggregated_text <- paste(aggregated_text, "\n\nBayesian Analysis Results:\n", publicationReadyBayes(),
+                             "\nFor the Public (Bayesian):\n", publicationReadyBayesPublic())
+    prompt <- paste(
+      "Combine the following sections into one comprehensive final report that is coherent and publication-ready in a formal academic style. Ensure the report is organized into sections and paragraphs and remove any duplicate headings. Also include a section for the public translation. Here are the sections:\n\n",
+      aggregated_text
+    )
+    polishAndWarn(prompt)
+  })
+  
+  output$aggregatedOutput <- renderUI({
+    req(aggregatedFinal())
+    HTML(paste0("<h2>Full results</h2><p>", gsub("\n", "<br>", aggregatedFinal()), "</p>"))
+  })
+  
+  ### Dynamic Main Tabs ###
+  output$mainTabs <- renderUI({
+    req(metaAnalysis())
+    df <- dataInput()
+    tabsList <- list(
+      tabPanel("Forest Plot",
+               plotOutput("forestPlot"),
+               h4("Meta Analysis Summary"),
+               verbatimTextOutput("metaSummary")
+      ),
+      tabPanel("Heterogeneity Analysis",
+               h4("Heterogeneity Analysis"),
+               verbatimTextOutput("hetro"),
+               h5("Baujat Plot"),
+               plotOutput("Baujatplot"),
+               downloadButton("downloadBaujat", "Download Baujat Plot"),
+               hr(),
+               h5("Influence Plot"),
+               plotOutput("Influence"),
+               downloadButton("downloadInfluence", "Download Influence Plot")
+      ),
+      tabPanel("Meta-analysis result",
+               htmlOutput("resultsOutput")
+      ),
+      tabPanel("Sensitivity Analysis Results",
+               htmlOutput("sensitivityOutput")
+      ),
+      tabPanel("Bayesian Analysis Text Results",
+               htmlOutput("bayesTextOutput")
+      ),
+      tabPanel("Bayesian Analysis Plots",
+               conditionalPanel(
+                 condition = "input.showBayesPlot == true",
+                 plotOutput("bayesPlot"),
+                 downloadButton("downloadBayesPlot", "Download Bayesian Plot")
+               )
+      ),
+      tabPanel("Full results",
+               htmlOutput("aggregatedOutput")
+      )
+    )
+    do.call(tabsetPanel, unname(tabsList))
+  })
+}
+
+shinyApp(ui = ui, server = server)
