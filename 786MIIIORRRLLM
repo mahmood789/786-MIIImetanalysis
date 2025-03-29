@@ -61,7 +61,7 @@ ui <- bs4DashPage(
           solidHeader = TRUE,
           width = 12,
           p("Upload a CSV file with the following columns (binary outcome data for RR/OR): 
-            evente, totale, eventc, totalc, author, Reg, Reg2, Reg3, Subgroup."),
+            eventintervention, totalintervention, eventcontrol, totalcontrol, author, Reg, Reg2, Reg3, Subgroup."),
           fileInput("fileInput", "Upload CSV File", accept = c("text/csv", ".csv")),
           br(),
           # Download buttons for sample CSV files
@@ -128,10 +128,10 @@ server <- function(input, output, session) {
     filename = function() { "basic_sample.csv" },
     content = function(file) {
       basic_sample <- data.frame(
-        evente = c(10, 15, 20, 25, 30),
-        totale = c(50, 60, 70, 80, 90),
-        eventc = c(5, 7, 10, 12, 15),
-        totalc = c(50, 60, 70, 80, 90),
+        eventintervention = c(10, 15, 20, 25, 30),
+        totalintervention = c(50, 60, 70, 80, 90),
+        eventcontrol = c(5, 7, 10, 12, 15),
+        totalcontrol = c(50, 60, 70, 80, 90),
         author = c("StudyA", "StudyB", "StudyC", "StudyD", "StudyE")
       )
       write.csv(basic_sample, file, row.names = FALSE)
@@ -142,10 +142,10 @@ server <- function(input, output, session) {
     filename = function() { "meta_regression_sample.csv" },
     content = function(file) {
       meta_sample <- data.frame(
-        evente = c(10, 15, 20, 25, 30),
-        totale = c(50, 60, 70, 80, 90),
-        eventc = c(5, 7, 10, 12, 15),
-        totalc = c(50, 60, 70, 80, 90),
+        eventintervention = c(10, 15, 20, 25, 30),
+        totalintervention = c(50, 60, 70, 80, 90),
+        eventcontrol = c(5, 7, 10, 12, 15),
+        totalcontrol = c(50, 60, 70, 80, 90),
         author = c("StudyA", "StudyB", "StudyC", "StudyD", "StudyE"),
         Reg = c(1.2, 1.5, 1.8, 1.3, 1.6),
         Reg2 = c(2.3, 2.0, 2.5, 2.1, 2.4),
@@ -159,10 +159,10 @@ server <- function(input, output, session) {
     filename = function() { "extended_sample.csv" },
     content = function(file) {
       extended_sample <- data.frame(
-        evente = c(10, 15, 20, 25, 30),
-        totale = c(50, 60, 70, 80, 90),
-        eventc = c(5, 7, 10, 12, 15),
-        totalc = c(50, 60, 70, 80, 90),
+        eventintervention = c(10, 15, 20, 25, 30),
+        totalintervention = c(50, 60, 70, 80, 90),
+        eventcontrol = c(5, 7, 10, 12, 15),
+        totalcontrol = c(50, 60, 70, 80, 90),
         author = c("StudyA", "StudyB", "StudyC", "StudyD", "StudyE"),
         Reg = c(1.2, 1.5, 1.8, 1.3, 1.6),
         Reg2 = c(2.3, 2.0, 2.5, 2.1, 2.4),
@@ -178,7 +178,7 @@ server <- function(input, output, session) {
     req(input$fileInput)
     dat <- read.csv(input$fileInput$datapath)
     # Validate that required columns exist (for basic analysis)
-    required_cols <- c("evente", "totale", "eventc", "totalc", "author")
+    required_cols <- c("eventintervention", "totalintervention", "eventcontrol", "totalcontrol", "author")
     if (!all(required_cols %in% names(dat))) {
       stop("Uploaded CSV file is missing one or more required columns: ", paste(required_cols, collapse = ", "))
     }
@@ -188,10 +188,10 @@ server <- function(input, output, session) {
   metaResult <- reactive({
     req(dataInput())
     dat <- dataInput()
-    metabin(event.e = dat$evente,
-            n.e = dat$totale,
-            event.c = dat$eventc,
-            n.c = dat$totalc,
+    metabin(event.e = dat$eventintervention,
+            n.e = dat$totalintervention,
+            event.c = dat$eventcontrol,
+            n.c = dat$totalcontrol,
             studlab = dat$author,
             data = dat,
             sm = input$effectMeasure,
@@ -236,10 +236,10 @@ server <- function(input, output, session) {
     dat <- dataInput()
     if(all(c("Reg", "Reg2", "Reg3") %in% names(dat))){
       dat2 <- escalc(measure = input$effectMeasure,
-                     ai = dat$evente,
-                     n1i = dat$totale,
-                     ci = dat$eventc,
-                     n2i = dat$totalc,
+                     ai = dat$eventintervention,
+                     n1i = dat$totalintervention,
+                     ci = dat$eventcontrol,
+                     n2i = dat$totalcontrol,
                      data = dat,
                      slab = dat$author)
       m_reg <- rma(yi = dat2$yi, vi = dat2$vi, mods = ~ Reg + Reg2 + Reg3, data = dat2, method = "REML")
@@ -263,10 +263,10 @@ server <- function(input, output, session) {
       return("Bayesian meta-analysis function not available.")
     }
     dat2 <- escalc(measure = input$effectMeasure,
-                   ai = dat$evente,
-                   n1i = dat$totale,
-                   ci = dat$eventc,
-                   n2i = dat$totalc,
+                   ai = dat$eventintervention,
+                   n1i = dat$totalintervention,
+                   ci = dat$eventcontrol,
+                   n2i = dat$totalcontrol,
                    data = dat,
                    slab = dat$author)
     sigma <- sqrt(dat2$vi)
@@ -278,10 +278,10 @@ server <- function(input, output, session) {
     req(dataInput())
     dat <- dataInput()
     if("Subgroup" %in% names(dat)){
-      m_sub <- metabin(event.e = dat$evente,
-                       n.e = dat$totale,
-                       event.c = dat$eventc,
-                       n.c = dat$totalc,
+      m_sub <- metabin(event.e = dat$eventintervention,
+                       n.e = dat$totalintervention,
+                       event.c = dat$eventcontrol,
+                       n.c = dat$totalcontrol,
                        studlab = dat$author,
                        data = dat,
                        sm = input$effectMeasure,
@@ -340,10 +340,10 @@ server <- function(input, output, session) {
   fixedRandomText <- reactive({
     req(dataInput())
     dat <- dataInput()
-    fixed_model <- metabin(event.e = dat$evente,
-                           n.e = dat$totale,
-                           event.c = dat$eventc,
-                           n.c = dat$totalc,
+    fixed_model <- metabin(event.e = dat$eventintervention,
+                           n.e = dat$totalintervention,
+                           event.c = dat$eventcontrol,
+                           n.c = dat$totalcontrol,
                            studlab = dat$author,
                            data = dat,
                            sm = input$effectMeasure,
@@ -469,3 +469,7 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
+# 
+# year: (Optional) Year of publication for cumulative analysis
+# Reg, Reg2, Reg3: (Optional) Moderator variables for meta-regression
+# subgroup: (Optional) Subgroup identifier for subgroup analysis
