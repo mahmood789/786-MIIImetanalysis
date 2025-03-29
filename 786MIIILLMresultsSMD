@@ -41,12 +41,12 @@ clean_markdown <- function(text) {
 # UI
 # ---------------------------
 ui <- bs4DashPage(
-  title = "786MIII Meta-Analysis Text and LLM Integration (Give upto ten minutes) ",
-  header = bs4DashNavbar(title = "786MIII Meta-Analysis Text & LLM Integration (Give upto ten minutes)"),
+  title = "786MIII Meta-Analysis Text and LLM Integration",
+  header = bs4DashNavbar(title = "786MIII Meta-Analysis Text & LLM Integration"),
   sidebar = bs4DashSidebar(
     sidebarMenu(
       menuItem("Inputs", tabName = "inputs", icon = icon("upload")),
-      menuItem("Meta-Analysis Text (Give upto ten minutes)", tabName = "meta_text", icon = icon("file-alt"))
+      menuItem("Meta-Analysis Text", tabName = "meta_text", icon = icon("file-alt"))
     )
   ),
   body = bs4DashBody(
@@ -55,14 +55,16 @@ ui <- bs4DashPage(
       tabItem(
         tabName = "inputs",
         box(
-          title = "Data Input & Options (Give upto ten minutes)",
+          title = "Data Input & Options",
           status = "primary",
           solidHeader = TRUE,
           width = 12,
           p("Upload a CSV file with columns: 
             meanintervention, sdintervention, totalintervention, 
-            meancontrol, sdcontrol, totalcontrol, author, Reg, Reg2, Reg3, Subgroup."),
+            meancontrol, sdcontrol, totalcontrol, author, 
+            Reg, Reg2, Reg3, subgroup."),
           fileInput("fileInput", "Upload CSV File", accept = c("text/csv", ".csv")),
+          numericInput("defaultInterventionN", "Default Intervention Sample Size (if not provided in CSV)", value = 100, min = 1),
           radioButtons("effectMeasure", "Effect Measure:", choices = c("SMD" = "SMD", "MD" = "MD"), selected = "MD"),
           selectInput("method.smd", "Combination Method:", 
                       choices = c("Hedges" = "Hedges", "Glass" = "Glass", "Cohen" = "Cohen"), selected = "Hedges"),
@@ -71,20 +73,17 @@ ui <- bs4DashPage(
           selectInput("effectModel", "Effect Model:", 
                       choices = c("Random" = "RE", "Fixed" = "FE"), selected = "RE")
         ),
-        # New Box for Downloadable Sample Files
         box(
-          title = "Download Sample CSV Files",
+          title = "Download Sample CSV File",
           status = "info",
           solidHeader = TRUE,
           width = 12,
-          p("Select one of the following sample CSV files to download. They include different combinations of columns:"),
+          p("Download a sample CSV file containing all required columns: 
+            meanintervention, sdintervention, totalintervention, 
+            meancontrol, sdcontrol, totalcontrol, author, 
+            Reg, Reg2, Reg3, subgroup."),
           fluidRow(
-            column(6, downloadButton("download_sample_all", "Metaregression + Subgroup")),
-            column(6, downloadButton("download_sample_metareg", "Metaregression Only"))
-          ),
-          fluidRow(
-            column(6, downloadButton("download_sample_subgroup", "Subgroup Only")),
-            column(6, downloadButton("download_sample_basic", "Basic"))
+            column(12, downloadButton("download_sample_all", "Download Sample CSV"))
           )
         )
       ),
@@ -93,7 +92,7 @@ ui <- bs4DashPage(
         tabName = "meta_text",
         fluidRow(
           box(
-            title = "Expanded Meta-Analysis Text Results (Give upto ten minutes)",
+            title = "Expanded Meta-Analysis Text Results",
             status = "primary",
             solidHeader = TRUE,
             width = 12,
@@ -103,9 +102,9 @@ ui <- bs4DashPage(
               tabPanel("Leave-One-Out", htmlOutput("leaveOneOutTextOutput")),
               tabPanel("Publication Bias", htmlOutput("publicationBiasTextOutput")),
               tabPanel("Meta-Regression", htmlOutput("metaRegressionTextOutput")),
+              tabPanel("Subgroup Analysis", htmlOutput("subgroupAnalysisTextOutput")),
               tabPanel("Cumulative Meta-Analysis", htmlOutput("cumulativeMetaTextOutput")),
               tabPanel("Bayesian Meta-Analysis", htmlOutput("bayesianMetaTextOutput")),
-              tabPanel("Subgroup Analysis", htmlOutput("subgroupAnalysisTextOutput")),
               tabPanel("Trim and Fill", htmlOutput("trimFillTextOutput")),
               tabPanel("Outlier Detection", htmlOutput("outliersTextOutput")),
               tabPanel("P-Curve Analysis", htmlOutput("pcurveTextOutput")),
@@ -132,9 +131,15 @@ ui <- bs4DashPage(
 # ---------------------------
 server <- function(input, output, session) {
   
+  # Read CSV file
   dataInput <- reactive({
     req(input$fileInput)
-    read.csv(input$fileInput$datapath)
+    dat <- read.csv(input$fileInput$datapath)
+    # If the CSV does not include the intervention sample sizes, add a default column
+    if (!"totalintervention" %in% names(dat)) {
+      dat$totalintervention <- input$defaultInterventionN
+    }
+    dat
   })
   
   metaResult <- reactive({
@@ -156,10 +161,8 @@ server <- function(input, output, session) {
   })
   
   # ---------------------------
-  # Download Handlers for Sample CSV Files
+  # Download Handler for Sample CSV File
   # ---------------------------
-  
-  # Create a basic sample data frame (minimal columns)
   sample_basic <- data.frame(
     meanintervention = c(10, 12, 15, 8, 11),
     sdintervention   = c(2, 2.5, 3, 2, 2.2),
@@ -170,46 +173,11 @@ server <- function(input, output, session) {
     author           = c("Study1", "Study2", "Study3", "Study4", "Study5")
   )
   
-  # Sample with metaregression columns
-  sample_metareg <- sample_basic %>%
+  sample_all <- sample_basic %>%
     mutate(Reg = c(1, 2, 3, 4, 5),
            Reg2 = c(5, 4, 3, 2, 1),
-           Reg3 = c(2, 3, 2, 3, 2))
-  
-  # Sample with subgroup column
-  sample_subgroup <- sample_basic %>%
-    mutate(Subgroup = c("A", "B", "A", "B", "A"))
-  
-  # Sample with both metaregression and subgroup columns
-  sample_all <- sample_metareg %>%
-    mutate(Subgroup = c("A", "B", "A", "B", "A"))
-  
-  output$download_sample_basic <- downloadHandler(
-    filename = function() {
-      paste("sample_basic_", Sys.Date(), ".csv", sep = "")
-    },
-    content = function(file) {
-      write.csv(sample_basic, file, row.names = FALSE)
-    }
-  )
-  
-  output$download_sample_metareg <- downloadHandler(
-    filename = function() {
-      paste("sample_metareg_", Sys.Date(), ".csv", sep = "")
-    },
-    content = function(file) {
-      write.csv(sample_metareg, file, row.names = FALSE)
-    }
-  )
-  
-  output$download_sample_subgroup <- downloadHandler(
-    filename = function() {
-      paste("sample_subgroup_", Sys.Date(), ".csv", sep = "")
-    },
-    content = function(file) {
-      write.csv(sample_subgroup, file, row.names = FALSE)
-    }
-  )
+           Reg3 = c(2, 3, 2, 3, 2),
+           subgroup = c("A", "B", "A", "B", "A"))
   
   output$download_sample_all <- downloadHandler(
     filename = function() {
@@ -274,6 +242,30 @@ server <- function(input, output, session) {
     }
   })
   
+  subgroupAnalysisText <- reactive({
+    req(dataInput())
+    dat <- dataInput()
+    if("subgroup" %in% names(dat)){
+      m_sub <- metacont(n.e = dat$totalintervention,
+                        mean.e = dat$meanintervention,
+                        sd.e = dat$sdintervention,
+                        n.c = dat$totalcontrol,
+                        mean.c = dat$meancontrol,
+                        sd.c = dat$sdcontrol,
+                        studlab = dat$author,
+                        data = dat,
+                        sm = input$effectMeasure,
+                        method.smd = input$method.smd,
+                        method.tau = input$method.tau,
+                        common = (input$effectModel == "FE"),
+                        random = (input$effectModel == "RE"),
+                        subgroup = dat$subgroup)
+      paste(capture.output(print(summary(m_sub))), collapse = "\n")
+    } else {
+      "Subgroup analysis data not available."
+    }
+  })
+  
   cumulativeMetaText <- reactive({
     req(metaResult())
     m <- metaResult()
@@ -299,30 +291,6 @@ server <- function(input, output, session) {
     sigma <- sqrt(dat2$vi)
     bmeta <- bayesmeta::bayesmeta(y = dat2$yi, sigma = sigma)
     paste(capture.output(print(summary(bmeta))), collapse = "\n")
-  })
-  
-  subgroupAnalysisText <- reactive({
-    req(dataInput())
-    dat <- dataInput()
-    if("Subgroup" %in% names(dat)){
-      m_sub <- metacont(n.e = dat$totalintervention,
-                        mean.e = dat$meanintervention,
-                        sd.e = dat$sdintervention,
-                        n.c = dat$totalcontrol,
-                        mean.c = dat$meancontrol,
-                        sd.c = dat$sdcontrol,
-                        studlab = dat$author,
-                        data = dat,
-                        sm = input$effectMeasure,
-                        method.smd = input$method.smd,
-                        method.tau = input$method.tau,
-                        common = (input$effectModel == "FE"),
-                        random = (input$effectModel == "RE"),
-                        subgroup = dat$Subgroup)
-      paste(capture.output(print(summary(m_sub))), collapse = "\n")
-    } else {
-      "Subgroup analysis data not available."
-    }
   })
   
   trimFillText <- reactive({
@@ -397,9 +365,9 @@ server <- function(input, output, session) {
       "\nLeave-One-Out Analysis:\n", leaveOneOutText(),
       "\nPublication Bias:\n", publicationBiasText(),
       "\nMeta-Regression:\n", metaRegressionText(),
+      "\nSubgroup Analysis:\n", subgroupAnalysisText(),
       "\nCumulative Meta-Analysis:\n", cumulativeMetaText(),
       "\nBayesian Meta-Analysis:\n", bayesianMetaText(),
-      "\nSubgroup Analysis:\n", subgroupAnalysisText(),
       "\nTrim and Fill Analysis:\n", trimFillText(),
       "\nOutlier Detection:\n", outliersText(),
       "\nP-Curve Analysis:\n", pcurveText(),
@@ -418,11 +386,10 @@ server <- function(input, output, session) {
   output$leaveOneOutTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", leaveOneOutText()) })
   output$publicationBiasTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", publicationBiasText()) })
   output$metaRegressionTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", metaRegressionText()) })
+  output$subgroupAnalysisTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", subgroupAnalysisText()) })
   output$cumulativeMetaTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", cumulativeMetaText()) })
   output$bayesianMetaTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", bayesianMetaText()) })
-  output$subgroupAnalysisTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", subgroupAnalysisText()) })
   output$trimFillTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", trimFillText()) })
-  output$baujatTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", "Baujat analysis removed.") })
   output$outliersTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", outliersText()) })
   output$pcurveTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", pcurveText()) })
   output$overallSummaryTextOutput <- renderUI({ tags$div(style = "text-align: justify; white-space: pre-wrap;", overallSummaryText()) })
